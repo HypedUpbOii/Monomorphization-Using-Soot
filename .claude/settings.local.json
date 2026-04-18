@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(javac *)",
+      "Bash(java *)",
+      "Bash(javap -c -cp testcases/public_case Test)",
+      "Bash(awk '/static double bench2/,/^$/')",
+      "Bash(javap -c -cp testcases/public_case Test_optimized)",
+      "Bash(awk '/static double bench3/,/^$/')",
+      "Bash(javap -cp testcases/public_case Circle)"
+    ]
+  }
+}

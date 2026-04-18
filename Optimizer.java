@@ -20,9 +20,13 @@ public class Optimizer {
                 new Transform("wjtp.mono", new MonomorphizationTransformer()));
 
         // 3. Prepare arguments
+        //
+        // We deliberately omit -pp (prepend JVM classpath) because Soot 4.6.0 bundles
+        // an ASM version that cannot parse class files produced by Java 17+.  Instead
+        // we restrict the Soot classpath to the test directory only and allow all
+        // java.* / javax.* / jdk.* references to become phantom classes.
         String[] sootArgs = {
-            "-cp", classPath,
-            "-pp", // sets the class path for Soot
+            "-soot-classpath", processDir,
             "-w",
             "-app",
             "-p", "cg.spark", "enabled:true",

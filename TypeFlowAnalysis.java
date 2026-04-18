@@ -1,5 +1,6 @@
 import java.util.*;
 
+import soot.ArrayType;
 import soot.FastHierarchy;
 import soot.Local;
 import soot.RefType;
@@ -8,8 +9,10 @@ import soot.SootClass;
 import soot.SootMethod;
 import soot.Unit;
 import soot.Value;
+import soot.jimple.ArrayRef;
 import soot.jimple.AssignStmt;
 import soot.jimple.CastExpr;
+import soot.jimple.FieldRef;
 import soot.jimple.IdentityStmt;
 import soot.jimple.InstanceInvokeExpr;
 import soot.jimple.InvokeExpr;
@@ -28,6 +31,8 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
     private final Map<Integer, Set<SootClass>> paramCtx;
     // Interprocedural summaries: method → (paramCtx → return types)
     private final Map<SootMethod, Map<Map<Integer, Set<SootClass>>, Set<SootClass>>> summaries;
+    // Shared heap abstraction: field/array-element type tracking
+    private final HeapAbstraction heap;
 
     // Maps parameter locals back to their index, built from IdentityStmts
     private final Map<Local, Integer> localToParam = new HashMap<>();
@@ -40,11 +45,13 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
     public TypeFlowAnalysis(
         DirectedGraph<Unit> graph,
         Map<Integer, Set<SootClass>> paramCtx,
-        Map<SootMethod, Map<Map<Integer, Set<SootClass>>, Set<SootClass>>> summaries
+        Map<SootMethod, Map<Map<Integer, Set<SootClass>>, Set<SootClass>>> summaries,
+        HeapAbstraction heap
     ) {
         super(graph);
         this.paramCtx = paramCtx;
         this.summaries = summaries;
+        this.heap = heap;
         initializeParams();
         doAnalysis();
         finalizeResults();
@@ -122,7 +129,9 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
         }
 
         if (unit instanceof AssignStmt) {
-            handleAssignment((AssignStmt) unit, out);
+            AssignStmt assign = (AssignStmt) unit;
+            handleStore(assign, out);    // field/array writes → update shared heap
+            handleAssignment(assign, out); // local := ... → update local type state
         }
     }
 
@@ -133,6 +142,25 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
         if (paramIdx == null) return;
         Set<SootClass> types = paramCtx.get(paramIdx);
         if (types != null && !types.isEmpty()) out.set(lhs, types);
+    }
+
+    // Handles writes where the LHS is a field slot or array element.
+    // Reads the RHS local's current type set and adds it to the shared heap.
+    private void handleStore(AssignStmt stmt, TypeState state) {
+        Value lhs = stmt.getLeftOp();
+        Value rhs = stmt.getRightOp();
+        Set<SootClass> rhsTypes = rhs instanceof Local
+            ? state.get((Local) rhs)
+            : Collections.emptySet();
+
+        if (lhs instanceof FieldRef) {
+            heap.addFieldTypes(((FieldRef) lhs).getField(), rhsTypes);
+        } else if (lhs instanceof ArrayRef) {
+            Value base = ((ArrayRef) lhs).getBase();
+            if (base.getType() instanceof ArrayType) {
+                heap.addArrayElementTypes((ArrayType) base.getType(), rhsTypes);
+            }
+        }
     }
 
     private void handleAssignment(AssignStmt stmt, TypeState out) {
@@ -164,12 +192,30 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
             return;
         }
 
-        // FieldRef, ArrayRef, or any other untracked source — clear to avoid stale type info
-        // from a previous assignment to the same local
+        // Field read: look up what types the shared heap says can live in this slot.
+        if (rhs instanceof FieldRef) {
+            Set<SootClass> types = heap.getFieldTypes(((FieldRef) rhs).getField());
+            out.set(lhsLocal, new HashSet<>(types));
+            return;
+        }
+
+        // Array element read: look up element types for this array base type.
+        if (rhs instanceof ArrayRef) {
+            Value base = ((ArrayRef) rhs).getBase();
+            if (base.getType() instanceof ArrayType) {
+                Set<SootClass> types = heap.getArrayElementTypes((ArrayType) base.getType());
+                out.set(lhsLocal, new HashSet<>(types));
+                return;
+            }
+        }
+
+        // Any other untracked source — clear to avoid carrying stale types.
         out.set(lhsLocal, Collections.emptySet());
     }
 
     private void handleCast(CastExpr cast, Local lhs, TypeState out) {
+        // Always clear lhs first so no stale type from a previous assignment leaks through.
+        out.set(lhs, Collections.emptySet());
         if (!(cast.getOp() instanceof Local)) return;
         if (!(cast.getCastType() instanceof RefType)) return;
         SootClass castClass = ((RefType) cast.getCastType()).getSootClass();
@@ -178,7 +224,8 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
         for (SootClass c : out.get((Local) cast.getOp())) {
             if (fh.canStoreClass(c, castClass)) narrowed.add(c);
         }
-        if (!narrowed.isEmpty()) out.set(lhs, narrowed);
+        // Unconditional: sets types if non-empty, removes entry if empty (clears stale).
+        out.set(lhs, narrowed);
     }
 
     private void handleInvokeResult(InvokeExpr ie, Local lhs, TypeState out) {

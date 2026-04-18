@@ -36,6 +36,9 @@ public class MonomorphizationTransformer extends SceneTransformer {
     // Cache of created static clones: concreteMethod → concreteType → static clone
     private final Map<SootMethod, Map<SootClass, SootMethod>> monoClones = new HashMap<>();
 
+    // Shared heap abstraction: field/array-element type tracking (persists across passes)
+    private final HeapAbstraction heap = new HeapAbstraction();
+
     @Override
     protected void internalTransform(String phaseName, Map<String, String> options) {
         CallGraph callGraph = Scene.v().getCallGraph();
@@ -52,76 +55,93 @@ public class MonomorphizationTransformer extends SceneTransformer {
     // -------------------------------------------------------------------------
 
     private void runContextSensitiveAnalysis(List<SootMethod> reachable) {
-        Deque<AnalysisTask> worklist = new ArrayDeque<>();
-        // Track which (method, context) pairs have already been processed
-        Map<SootMethod, Set<Map<Integer, Set<SootClass>>>> processed = new HashMap<>();
+        // Outer fixed-point loop: re-run the full worklist whenever the heap abstraction
+        // grows (new types discovered in field/array slots).  The heap is monotone and
+        // finite, so this always terminates.
+        int pass = 0;
+        do {
+            heap.clearChanged();
+            summaries.clear();
+            receiverTypesPerSite.clear();
 
-        // Seed: all reachable application methods with an empty (unknown) context.
-        // Entry points are covered here; methods reachable only from library code
-        // get the conservative empty-context analysis as a fallback.
-        for (SootMethod m : reachable) {
-            worklist.add(new AnalysisTask(m, new HashMap<>()));
-        }
+            Deque<AnalysisTask> worklist = new ArrayDeque<>();
+            // Track which (method, context) pairs have already been processed
+            Map<SootMethod, Set<Map<Integer, Set<SootClass>>>> processed = new HashMap<>();
 
-        while (!worklist.isEmpty()) {
-            AnalysisTask task = worklist.removeFirst();
-            SootMethod method = task.method;
-            Map<Integer, Set<SootClass>> paramCtx = task.paramCtx;
-
-            if (!isAnalyzable(method)) continue;
-
-            // Skip if we already processed this (method, context) pair
-            Set<Map<Integer, Set<SootClass>>> methodCtxs =
-                processed.computeIfAbsent(method, k -> new HashSet<>());
-            if (!methodCtxs.add(deepCopyContext(paramCtx))) continue;
-
-            Body body;
-            try {
-                body = method.retrieveActiveBody();
-            } catch (RuntimeException e) {
-                continue;
+            // Seed: all reachable application methods with an empty (unknown) context.
+            // Entry points are covered here; methods reachable only from library code
+            // get the conservative empty-context analysis as a fallback.
+            for (SootMethod m : reachable) {
+                worklist.add(new AnalysisTask(m, new HashMap<>()));
             }
 
-            TypeFlowAnalysis tfa = new TypeFlowAnalysis(
-                new BriefUnitGraph(body), paramCtx, summaries
-            );
+            while (!worklist.isEmpty()) {
+                AnalysisTask task = worklist.removeFirst();
+                SootMethod method = task.method;
+                Map<Integer, Set<SootClass>> paramCtx = task.paramCtx;
 
-            // Update this method's return-type summary for this context
-            summaries.computeIfAbsent(method, k -> new HashMap<>())
-                     .put(deepCopyContext(paramCtx), new HashSet<>(tfa.returnTypes));
+                if (!isAnalyzable(method)) continue;
 
-            // Accumulate receiver types for each virtual call site (union across contexts)
-            Map<Stmt, Set<SootClass>> sitesForMethod =
-                receiverTypesPerSite.computeIfAbsent(method, k -> new HashMap<>());
-            tfa.receiverTypesAtSite.forEach((stmt, types) ->
-                sitesForMethod.computeIfAbsent(stmt, k -> new HashSet<>()).addAll(types));
+                // Skip if we already processed this (method, context) pair
+                Set<Map<Integer, Set<SootClass>>> methodCtxs =
+                    processed.computeIfAbsent(method, k -> new HashSet<>());
+                if (!methodCtxs.add(deepCopyContext(paramCtx))) continue;
 
-            // Enqueue callees with the concrete argument contexts we just discovered
-            for (Map.Entry<Stmt, Map<Integer, Set<SootClass>>> entry : tfa.callSiteArgCtx.entrySet()) {
-                Stmt callSite = entry.getKey();
-                Map<Integer, Set<SootClass>> argCtx = entry.getValue();
-                InvokeExpr ie = callSite.getInvokeExpr();
+                Body body;
+                try {
+                    body = method.retrieveActiveBody();
+                } catch (RuntimeException e) {
+                    continue;
+                }
 
-                if (ie instanceof VirtualInvokeExpr) {
-                    // For virtual calls: enqueue each concrete dispatch target separately,
-                    // refining the context with the specific receiver type
-                    Set<SootClass> receiverTypes = tfa.receiverTypesAtSite.get(callSite);
-                    if (receiverTypes == null) continue;
-                    for (SootClass receiverType : receiverTypes) {
-                        SootMethod concreteTarget = resolveDispatch(receiverType, ie.getMethod());
-                        if (concreteTarget == null || !isAnalyzable(concreteTarget)) continue;
-                        Map<Integer, Set<SootClass>> calleeCtx = deepCopyContext(argCtx);
-                        calleeCtx.put(-1, Collections.singleton(receiverType));
-                        worklist.add(new AnalysisTask(concreteTarget, calleeCtx));
-                    }
-                } else {
-                    SootMethod callee = ie.getMethod();
-                    if (isAnalyzable(callee)) {
-                        worklist.add(new AnalysisTask(callee, deepCopyContext(argCtx)));
+                TypeFlowAnalysis tfa = new TypeFlowAnalysis(
+                    new BriefUnitGraph(body), paramCtx, summaries, heap
+                );
+
+                // Update this method's return-type summary for this context
+                summaries.computeIfAbsent(method, k -> new HashMap<>())
+                         .put(deepCopyContext(paramCtx), new HashSet<>(tfa.returnTypes));
+
+                // Accumulate receiver types for each virtual call site (union across contexts)
+                Map<Stmt, Set<SootClass>> sitesForMethod =
+                    receiverTypesPerSite.computeIfAbsent(method, k -> new HashMap<>());
+                tfa.receiverTypesAtSite.forEach((stmt, types) ->
+                    sitesForMethod.computeIfAbsent(stmt, k -> new HashSet<>()).addAll(types));
+
+                // Enqueue callees with the concrete argument contexts we just discovered
+                for (Map.Entry<Stmt, Map<Integer, Set<SootClass>>> entry : tfa.callSiteArgCtx.entrySet()) {
+                    Stmt callSite = entry.getKey();
+                    Map<Integer, Set<SootClass>> argCtx = entry.getValue();
+                    InvokeExpr ie = callSite.getInvokeExpr();
+
+                    if (ie instanceof VirtualInvokeExpr) {
+                        // For virtual calls: enqueue each concrete dispatch target separately,
+                        // refining the context with the specific receiver type
+                        Set<SootClass> receiverTypes = tfa.receiverTypesAtSite.get(callSite);
+                        if (receiverTypes == null) continue;
+                        for (SootClass receiverType : receiverTypes) {
+                            SootMethod concreteTarget = resolveDispatch(receiverType, ie.getMethod());
+                            if (concreteTarget == null || !isAnalyzable(concreteTarget)) continue;
+                            Map<Integer, Set<SootClass>> calleeCtx = deepCopyContext(argCtx);
+                            calleeCtx.put(-1, Collections.singleton(receiverType));
+                            worklist.add(new AnalysisTask(concreteTarget, calleeCtx));
+                        }
+                    } else {
+                        SootMethod callee = ie.getMethod();
+                        if (isAnalyzable(callee)) {
+                            worklist.add(new AnalysisTask(callee, deepCopyContext(argCtx)));
+                        }
                     }
                 }
             }
-        }
+
+            pass++;
+            if (heap.isChanged()) {
+                System.out.println("Heap changed in pass " + pass + ", re-running analysis...");
+            }
+        } while (heap.isChanged());
+
+        System.out.println("Analysis converged after " + pass + " pass(es).");
     }
 
     // -------------------------------------------------------------------------
