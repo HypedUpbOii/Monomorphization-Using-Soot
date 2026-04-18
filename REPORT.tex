@@ -333,24 +333,28 @@ to feed the JIT, which inlines the static clone and folds the cast away
 
 \subsubsection*{DaCapo 9.12 benchmarks (\texttt{-s default}, \texttt{-Xint}, 3 runs each)}
 
-Unit: seconds wall-clock. ``Sites'' is the number of application-level
-call sites the transformer rewrote (JDK targets deliberately skipped).
+Unit: milliseconds, reported by DaCapo's own ``\texttt{PASSED in X msec}''
+line (stderr), which excludes JVM startup so the numbers reflect the
+benchmark body only. ``Sites'' is the number of application-level call
+sites the transformer rewrote (JDK targets deliberately skipped).
 
-\begin{table}[h]
+\begin{table}[ht]
 \centering
 \small
+\setlength{\tabcolsep}{5pt}
 \begin{tabular}{@{}lrrrrrr@{}}
 \toprule
-Benchmark & Sites & Baseline mean & Baseline min & Optimized mean & Optimized min & Speedup \\
+Benchmark   & Sites & Baseline runs (ms) & Base mean & Optimized runs (ms) & Opt mean & Speedup \\
 \midrule
-\texttt{xalan}   & 282   & 4.65\,s & 4.55\,s & 4.19\,s & 4.15\,s & $\mathbf{1.11\times}$ \\
-\texttt{avrora}  & 1\,090 & 8.70\,s & 8.32\,s & 8.40\,s & 8.32\,s & $1.04\times$ \\
-\texttt{fop}     & 2\,231 & 3.22\,s & 3.19\,s & 3.18\,s & 3.13\,s & $1.01\times$ \\
-\texttt{luindex} & 1\,279 & 5.16\,s & 5.05\,s & 5.19\,s & 5.06\,s & $0.99\times$ \\
+\texttt{xalan}   & 282    & 4423 / 4316 / 3960 & 4233 & 3965 / 3923 / 3943 & 3944 & $\mathbf{1.07\times}$ \\
+\texttt{avrora}  & 1\,090 & 8703 / 8448 / 8567 & 8573 & 8316 / 8180 / 8254 & 8250 & $1.04\times$ \\
+\texttt{fop}     & 2\,231 & 3146 / 3074 / 2995 & 3072 & 3005 / 2994 / 3002 & 3000 & $1.02\times$ \\
+\texttt{luindex} & 1\,279 & 4934 / 4851 / 4828 & 4871 & 4823 / 4836 / 5025 & 4895 & $1.00\times$ \\
 \bottomrule
 \end{tabular}
-\caption{DaCapo 9.12 benchmarks, JIT disabled. \texttt{batik} excluded
-because DaCapo-9.12 still requires \texttt{com.sun.image.codec.jpeg},
+\caption{DaCapo 9.12 benchmarks, JIT disabled, timed by the harness's
+internal millisecond counter (JVM startup excluded). \texttt{batik}
+skipped --- DaCapo-9.12 still requires \texttt{com.sun.image.codec.jpeg},
 which was removed in JDK 9.}
 \end{table}
 
@@ -360,42 +364,44 @@ which was removed in JDK 9.}
 \subsection*{Discussion}
 
 \begin{itemize}[topsep=2pt,itemsep=0pt]
-  \item \texttt{xalan} sees the largest genuine win ($+11\%$) despite
+  \item \texttt{xalan} sees the largest genuine win ($+7\%$) despite
     having the fewest rewritten sites: those 282 sites sit on the tight
     XSLT template-dispatch loop that dominates its interpreted runtime.
-  \item \texttt{luindex}'s interpreted time is spent mostly in JDK code
-    paths (file channels, regular expressions,
-    \texttt{StringBuilder}) --- exactly the surface our JDK-skip filter
+  \item \texttt{luindex} is essentially flat --- its interpreted time is
+    spent mostly in JDK code paths (file channels, regular expressions,
+    \texttt{StringBuilder}), exactly the surface our JDK-skip filter
     refuses to rewrite, so there is nothing to gain.
-  \item \texttt{avrora} and \texttt{fop} show small positive deltas
-    ($+1$--$4\%$); their hot paths are mixed app/JDK, so devirtualization
-    dilutes proportionally.
-  \item No benchmark regresses beyond $\sim1\%$ noise, indicating the
-    checkcast-insertion cost and the extra static-frame overhead are
-    well-contained.
+  \item \texttt{avrora} ($+4\%$) and \texttt{fop} ($+2\%$) show small
+    positive deltas; their hot paths are mixed app/JDK, so
+    devirtualization dilutes proportionally.
+  \item No benchmark regresses, indicating the checkcast-insertion cost
+    and the extra static-frame overhead are well-contained at whole-program
+    scale.
 \end{itemize}
 
 \subsection{Reproduction}
 
-All numbers can be reproduced with the supplied driver script:
+All numbers above can be reproduced with the supplied driver script
+\texttt{bench\_dacapo.sh}:
 
 \begin{lstlisting}[language=bash]
 # default: luindex avrora xalan fop, 3 runs, -s default, JIT off
-./bench.sh
+bash bench_dacapo.sh
 
 # quick smoke test
-SIZE=small RUNS=1 ./bench.sh
+SIZE=small RUNS=1 bash bench_dacapo.sh
 
 # subset with more runs
-BENCHES="xalan avrora" RUNS=5 ./bench.sh
+BENCHES="xalan avrora" RUNS=5 bash bench_dacapo.sh
 \end{lstlisting}
 
-The script recompiles the transformer, applies it once per benchmark to
-emit a \texttt{mono-<bench>/} directory of \texttt{.class} files, then
-runs \texttt{java -Xint -cp dacapo.jar Harness -s default <bench>}
-\texttt{RUNS} times for the baseline and again with
-\texttt{mono-<bench>/} prepended to the classpath, emitting per-run
-times, means, mins, and speedup ratios to stdout and
-\texttt{bench-results/}.
+The script recompiles the transformer, applies it once per benchmark
+to emit a per-benchmark \texttt{mono-out-*} directory of class files
+under \texttt{bench-results/}, and then runs the DaCapo harness under
+\texttt{-Xint} RUNS times for the baseline and again with that
+directory prepended to the classpath. Timings are harvested from
+DaCapo's internal ``\texttt{PASSED in X msec}'' line so JVM startup is
+not counted. Per-run times, optimizer logs, and emitted class files
+are preserved under \texttt{bench-results/}.
 
 \end{document}
