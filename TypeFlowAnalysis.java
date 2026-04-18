@@ -1,84 +1,56 @@
 import java.util.*;
 
-import soot.FastHierarchy;
-import soot.Local;
-import soot.RefType;
-import soot.Scene;
-import soot.SootClass;
-import soot.SootField;
-import soot.SootMethod;
-import soot.Type;
-import soot.Unit;
-import soot.Value;
-import soot.jimple.ArrayRef;
-import soot.jimple.AssignStmt;
-import soot.jimple.CastExpr;
-import soot.jimple.FieldRef;
-import soot.jimple.IdentityStmt;
-import soot.jimple.InstanceInvokeExpr;
-import soot.jimple.InterfaceInvokeExpr;
-import soot.jimple.InvokeExpr;
-import soot.jimple.NewExpr;
-import soot.jimple.ParameterRef;
-import soot.jimple.ReturnStmt;
-import soot.jimple.Stmt;
-import soot.jimple.ThisRef;
-import soot.jimple.VirtualInvokeExpr;
+import soot.*;
+import soot.jimple.*;
+import soot.jimple.internal.JAssignStmt;
 import soot.toolkits.graph.DirectedGraph;
 import soot.toolkits.scalar.ForwardFlowAnalysis;
 
 public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
 
-    // Context: parameter index (-1 = this) → concrete types provided by caller
-    private final Map<Integer, Set<SootClass>> paramCtx;
-    // Interprocedural summaries: method → (paramCtx → return types)
-    private final Map<SootMethod, Map<Map<Integer, Set<SootClass>>, Set<SootClass>>> summaries;
-    // Field-based global: field → union of concrete types ever written to it
-    private final Map<SootField, Set<SootClass>> fieldTypes;
-    // Array-element-type-based global: element Type → union of concrete types ever stored
-    private final Map<Type, Set<SootClass>> arrayElemTypes;
+    // caller-provided parameter types: index -> types (-1 is the receiver)
+    Map<Integer, Set<SootClass>> paramCtx;
+    // method -> (ctx -> set of classes returned by that method under that ctx)
+    Map<SootMethod, Map<Map<Integer, Set<SootClass>>, Set<SootClass>>> summaries;
+    // field -> union of types stored into it anywhere in the program so far
+    Map<SootField, Set<SootClass>> fieldTypes;
+    // array element type -> union of types stored into arrays of that element type
+    Map<Type, Set<SootClass>> arrayElemTypes;
 
-    // Maps parameter locals back to their index, built from IdentityStmts
-    private final Map<Local, Integer> localToParam = new HashMap<>();
+    Map<Local, Integer> paramOf = new HashMap<>();
 
-    // Outputs populated after doAnalysis() + finalizeResults()
-    final Map<Stmt, Set<SootClass>> receiverTypesAtSite = new HashMap<>();
-    final Map<Stmt, Map<Integer, Set<SootClass>>> callSiteArgCtx = new HashMap<>();
-    final Set<SootClass> returnTypes = new HashSet<>();
+    // results collected by finalizeResults()
+    Map<Stmt, Set<SootClass>> receiverTypesAtSite = new HashMap<>();
+    Map<Stmt, Map<Integer, Set<SootClass>>> callSiteArgCtx = new HashMap<>();
+    Set<SootClass> returnTypes = new HashSet<>();
 
-    public TypeFlowAnalysis(
-        DirectedGraph<Unit> graph,
-        Map<Integer, Set<SootClass>> paramCtx,
-        Map<SootMethod, Map<Map<Integer, Set<SootClass>>, Set<SootClass>>> summaries,
-        Map<SootField, Set<SootClass>> fieldTypes,
-        Map<Type, Set<SootClass>> arrayElemTypes
-    ) {
-        super(graph);
+    public TypeFlowAnalysis(DirectedGraph<Unit> g,
+                            Map<Integer, Set<SootClass>> paramCtx,
+                            Map<SootMethod, Map<Map<Integer, Set<SootClass>>, Set<SootClass>>> summaries,
+                            Map<SootField, Set<SootClass>> fieldTypes,
+                            Map<Type, Set<SootClass>> arrayElemTypes) {
+        super(g);
         this.paramCtx = paramCtx;
         this.summaries = summaries;
         this.fieldTypes = fieldTypes;
         this.arrayElemTypes = arrayElemTypes;
-        initializeParams();
+
+        // walk the identity stmts first so we know which local is which param
+        for (Unit u : g) {
+            if (!(u instanceof IdentityStmt)) continue;
+            IdentityStmt id = (IdentityStmt) u;
+            if (!(id.getLeftOp() instanceof Local)) continue;
+            Local l = (Local) id.getLeftOp();
+            Value r = id.getRightOp();
+            if (r instanceof ThisRef) paramOf.put(l, -1);
+            else if (r instanceof ParameterRef) paramOf.put(l, ((ParameterRef) r).getIndex());
+        }
+
         doAnalysis();
         finalizeResults();
     }
 
-    private void initializeParams() {
-        for (Unit unit : graph) {
-            if (!(unit instanceof IdentityStmt)) continue;
-            IdentityStmt id = (IdentityStmt) unit;
-            if (!(id.getLeftOp() instanceof Local)) continue;
-            Local l = (Local) id.getLeftOp();
-            if (id.getRightOp() instanceof ThisRef) {
-                localToParam.put(l, -1);
-            } else if (id.getRightOp() instanceof ParameterRef) {
-                localToParam.put(l, ((ParameterRef) id.getRightOp()).getIndex());
-            }
-        }
-    }
-
     private void finalizeResults() {
-        // Collect return types from all exit nodes
         for (Unit tail : graph.getTails()) {
             if (!(tail instanceof ReturnStmt)) continue;
             Value op = ((ReturnStmt) tail).getOp();
@@ -87,214 +59,159 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
             }
         }
 
-        // Collect receiver types and arg contexts at every call site
-        for (Unit unit : graph) {
-            if (!(unit instanceof Stmt)) continue;
-            Stmt stmt = (Stmt) unit;
-            if (!stmt.containsInvokeExpr()) continue;
+        for (Unit u : graph) {
+            if (!(u instanceof Stmt)) continue;
+            Stmt s = (Stmt) u;
+            if (!s.containsInvokeExpr()) continue;
 
-            TypeState before = getFlowBefore(unit);
-            InvokeExpr ie = stmt.getInvokeExpr();
+            TypeState before = getFlowBefore(u);
+            InvokeExpr ie = s.getInvokeExpr();
 
-            // Build arg context: index → concrete types of that argument
-            Map<Integer, Set<SootClass>> argCtx = new HashMap<>();
+            // build the arg context for this call site
+            Map<Integer, Set<SootClass>> ctx = new HashMap<>();
             if (ie instanceof InstanceInvokeExpr) {
                 Value base = ((InstanceInvokeExpr) ie).getBase();
                 if (base instanceof Local) {
-                    Set<SootClass> baseTypes = before.get((Local) base);
-                    if (!baseTypes.isEmpty()) argCtx.put(-1, new HashSet<>(baseTypes));
+                    Set<SootClass> t = before.get((Local) base);
+                    if (!t.isEmpty()) ctx.put(-1, new HashSet<>(t));
                 }
             }
             for (int i = 0; i < ie.getArgCount(); i++) {
-                Value arg = ie.getArg(i);
-                if (arg instanceof Local) {
-                    Set<SootClass> argTypes = before.get((Local) arg);
-                    if (!argTypes.isEmpty()) argCtx.put(i, new HashSet<>(argTypes));
-                }
+                Value a = ie.getArg(i);
+                if (!(a instanceof Local)) continue;
+                Set<SootClass> t = before.get((Local) a);
+                if (!t.isEmpty()) ctx.put(i, new HashSet<>(t));
             }
-            if (!argCtx.isEmpty()) callSiteArgCtx.put(stmt, argCtx);
+            if (!ctx.isEmpty()) callSiteArgCtx.put(s, ctx);
 
-            // For dispatched calls (virtual or interface) record receiver concrete types
+            // dispatched calls: remember what the receiver can be
             if (ie instanceof VirtualInvokeExpr || ie instanceof InterfaceInvokeExpr) {
                 Value base = ((InstanceInvokeExpr) ie).getBase();
                 if (base instanceof Local) {
-                    Set<SootClass> types = before.get((Local) base);
-                    if (!types.isEmpty()) receiverTypesAtSite.put(stmt, new HashSet<>(types));
+                    Set<SootClass> t = before.get((Local) base);
+                    if (!t.isEmpty()) receiverTypesAtSite.put(s, new HashSet<>(t));
                 }
             }
         }
     }
 
     @Override
-    protected void flowThrough(TypeState in, Unit unit, TypeState out) {
-        out.copyFrom(in);
+    protected void flowThrough(TypeState in, Unit u, TypeState out) {
+        in.copy(out);
 
-        if (unit instanceof IdentityStmt) {
-            handleIdentity((IdentityStmt) unit, out);
+        // parameter/this seeds -- only fills lhs when caller gave us a type
+        if (u instanceof IdentityStmt) {
+            IdentityStmt id = (IdentityStmt) u;
+            if (!(id.getLeftOp() instanceof Local)) return;
+            Local l = (Local) id.getLeftOp();
+            Integer idx = paramOf.get(l);
+            if (idx == null) return;
+            Set<SootClass> t = paramCtx.get(idx);
+            if (t != null && !t.isEmpty()) out.set(l, t);
             return;
         }
 
-        if (unit instanceof AssignStmt) {
-            handleAssignment((AssignStmt) unit, out);
-        }
-    }
-
-    private void handleIdentity(IdentityStmt stmt, TypeState out) {
-        if (!(stmt.getLeftOp() instanceof Local)) return;
-        Local lhs = (Local) stmt.getLeftOp();
-        Integer paramIdx = localToParam.get(lhs);
-        if (paramIdx == null) return;
-        Set<SootClass> types = paramCtx.get(paramIdx);
-        if (types != null && !types.isEmpty()) out.set(lhs, types);
-    }
-
-    private void handleAssignment(AssignStmt stmt, TypeState out) {
+        if (!(u instanceof JAssignStmt)) return;
+        JAssignStmt stmt = (JAssignStmt) u;
         Value lhs = stmt.getLeftOp();
         Value rhs = stmt.getRightOp();
 
-        // Writes to fields or arrays: contribute rhs types to the global map
+        // stores into fields / arrays: accumulate into the global table
         if (lhs instanceof FieldRef) {
-            recordFieldWrite((FieldRef) lhs, rhs, out);
+            if (!(rhs instanceof Local)) return;
+            Set<SootClass> t = out.get((Local) rhs);
+            if (t.isEmpty()) return;
+            SootField f = ((FieldRef) lhs).getField();
+            fieldTypes.computeIfAbsent(f, k -> new HashSet<>()).addAll(t);
             return;
         }
         if (lhs instanceof ArrayRef) {
-            recordArrayWrite((ArrayRef) lhs, rhs, out);
+            if (!(rhs instanceof Local)) return;
+            Set<SootClass> t = out.get((Local) rhs);
+            if (t.isEmpty()) return;
+            Type et = ((ArrayRef) lhs).getType();
+            arrayElemTypes.computeIfAbsent(et, k -> new HashSet<>()).addAll(t);
             return;
         }
 
         if (!(lhs instanceof Local)) return;
-        Local lhsLocal = (Local) lhs;
+        Local left = (Local) lhs;
 
         if (rhs instanceof NewExpr) {
-            SootClass cls = ((NewExpr) rhs).getBaseType().getSootClass();
-            out.set(lhsLocal, Collections.singleton(cls));
+            SootClass c = ((NewExpr) rhs).getBaseType().getSootClass();
+            out.set(left, Collections.singleton(c));
             return;
         }
 
         if (rhs instanceof CastExpr) {
-            handleCast((CastExpr) rhs, lhsLocal, out);
+            CastExpr ce = (CastExpr) rhs;
+            if (!(ce.getOp() instanceof Local)) return;
+            if (!(ce.getCastType() instanceof RefType)) return;
+            SootClass target = ((RefType) ce.getCastType()).getSootClass();
+            FastHierarchy fh = Scene.v().getOrMakeFastHierarchy();
+            Set<SootClass> keep = new HashSet<>();
+            for (SootClass c : out.get((Local) ce.getOp())) {
+                if (fh.canStoreClass(c, target)) keep.add(c);
+            }
+            if (!keep.isEmpty()) out.set(left, keep);
             return;
         }
 
         if (rhs instanceof Local) {
-            Set<SootClass> types = out.get((Local) rhs);
-            out.set(lhsLocal, types);
+            out.set(left, out.get((Local) rhs));
             return;
         }
 
         if (rhs instanceof InvokeExpr) {
-            handleInvokeResult((InvokeExpr) rhs, lhsLocal, out);
+            InvokeExpr ie = (InvokeExpr) rhs;
+            var calleeSummary = summaries.get(ie.getMethod());
+            if (calleeSummary == null || calleeSummary.isEmpty()) return;
+
+            // replicate the context build so we can look the summary up
+            Map<Integer, Set<SootClass>> ctx = new HashMap<>();
+            if (ie instanceof InstanceInvokeExpr) {
+                Value base = ((InstanceInvokeExpr) ie).getBase();
+                if (base instanceof Local) {
+                    Set<SootClass> t = out.get((Local) base);
+                    if (!t.isEmpty()) ctx.put(-1, new HashSet<>(t));
+                }
+            }
+            for (int i = 0; i < ie.getArgCount(); i++) {
+                Value a = ie.getArg(i);
+                if (!(a instanceof Local)) continue;
+                Set<SootClass> t = out.get((Local) a);
+                if (!t.isEmpty()) ctx.put(i, new HashSet<>(t));
+            }
+            Set<SootClass> ret = calleeSummary.get(ctx);
+            if (ret != null && !ret.isEmpty()) out.set(left, ret);
             return;
         }
 
-        // Reads from fields or arrays: fill lhs with the current global type set
         if (rhs instanceof FieldRef) {
             SootField f = ((FieldRef) rhs).getField();
             Set<SootClass> t = fieldTypes.get(f);
-            out.set(lhsLocal, t == null ? Collections.emptySet() : t);
+            out.set(left, t == null ? Collections.emptySet() : t);
             return;
         }
         if (rhs instanceof ArrayRef) {
             Type et = ((ArrayRef) rhs).getType();
             Set<SootClass> t = arrayElemTypes.get(et);
-            out.set(lhsLocal, t == null ? Collections.emptySet() : t);
+            out.set(left, t == null ? Collections.emptySet() : t);
             return;
         }
 
-        // Any other rhs (constants, etc.) — clear to avoid stale type info
-        out.set(lhsLocal, Collections.emptySet());
-    }
-
-    private void recordFieldWrite(FieldRef fieldRef, Value rhs, TypeState state) {
-        if (!(rhs instanceof Local)) return;
-        Set<SootClass> types = state.get((Local) rhs);
-        if (types.isEmpty()) return;
-        SootField f = fieldRef.getField();
-        fieldTypes.computeIfAbsent(f, k -> new HashSet<>()).addAll(types);
-    }
-
-    private void recordArrayWrite(ArrayRef arrayRef, Value rhs, TypeState state) {
-        if (!(rhs instanceof Local)) return;
-        Set<SootClass> types = state.get((Local) rhs);
-        if (types.isEmpty()) return;
-        Type et = arrayRef.getType();
-        arrayElemTypes.computeIfAbsent(et, k -> new HashSet<>()).addAll(types);
-    }
-
-    private void handleCast(CastExpr cast, Local lhs, TypeState out) {
-        if (!(cast.getOp() instanceof Local)) return;
-        if (!(cast.getCastType() instanceof RefType)) return;
-        SootClass castClass = ((RefType) cast.getCastType()).getSootClass();
-        FastHierarchy fh = Scene.v().getOrMakeFastHierarchy();
-        Set<SootClass> narrowed = new HashSet<>();
-        for (SootClass c : out.get((Local) cast.getOp())) {
-            if (fh.canStoreClass(c, castClass)) narrowed.add(c);
-        }
-        if (!narrowed.isEmpty()) out.set(lhs, narrowed);
-    }
-
-    private void handleInvokeResult(InvokeExpr ie, Local lhs, TypeState out) {
-        Set<SootClass> returnedTypes = new HashSet<>();
-
-        if (ie instanceof VirtualInvokeExpr || ie instanceof InterfaceInvokeExpr) {
-            // Summaries are stored under concrete methods; must resolve dispatch first.
-            Value base = ((InstanceInvokeExpr) ie).getBase();
-            if (!(base instanceof Local)) return;
-            Set<SootClass> receiverTypes = out.get((Local) base);
-            if (receiverTypes.isEmpty()) return;
-            Map<Integer, Set<SootClass>> argCtx = buildArgCtx(ie, out);
-            FastHierarchy fh = Scene.v().getOrMakeFastHierarchy();
-            for (SootClass receiverType : receiverTypes) {
-                SootMethod concrete;
-                try {
-                    concrete = fh.resolveConcreteDispatch(receiverType, ie.getMethod());
-                } catch (Exception e) { continue; }
-                if (concrete == null) continue;
-                Map<Map<Integer, Set<SootClass>>, Set<SootClass>> calleeSummary = summaries.get(concrete);
-                if (calleeSummary == null) continue;
-                Set<SootClass> ret = calleeSummary.get(argCtx);
-                if (ret != null) returnedTypes.addAll(ret);
-            }
-        } else {
-            SootMethod callee = ie.getMethod();
-            Map<Map<Integer, Set<SootClass>>, Set<SootClass>> calleeSummary = summaries.get(callee);
-            if (calleeSummary == null || calleeSummary.isEmpty()) return;
-            Map<Integer, Set<SootClass>> argCtx = buildArgCtx(ie, out);
-            Set<SootClass> ret = calleeSummary.get(argCtx);
-            if (ret != null) returnedTypes.addAll(ret);
-        }
-
-        if (!returnedTypes.isEmpty()) out.set(lhs, returnedTypes);
-    }
-
-    private Map<Integer, Set<SootClass>> buildArgCtx(InvokeExpr ie, TypeState state) {
-        Map<Integer, Set<SootClass>> ctx = new HashMap<>();
-        if (ie instanceof InstanceInvokeExpr) {
-            Value base = ((InstanceInvokeExpr) ie).getBase();
-            if (base instanceof Local) {
-                Set<SootClass> t = state.get((Local) base);
-                if (!t.isEmpty()) ctx.put(-1, new HashSet<>(t));
-            }
-        }
-        for (int i = 0; i < ie.getArgCount(); i++) {
-            Value arg = ie.getArg(i);
-            if (arg instanceof Local) {
-                Set<SootClass> t = state.get((Local) arg);
-                if (!t.isEmpty()) ctx.put(i, new HashSet<>(t));
-            }
-        }
-        return ctx;
+        // constants and anything else we don't model -- forget whatever we had
+        out.set(left, Collections.emptySet());
     }
 
     @Override
-    protected void copy(TypeState src, TypeState dest) {
-        dest.copyFrom(src);
+    protected void copy(TypeState src, TypeState dst) {
+        src.copy(dst);
     }
 
     @Override
     protected void merge(TypeState in1, TypeState in2, TypeState out) {
-        out.copyFrom(in1);
-        out.unionFrom(in2);
+        in1.union(in2, out);
     }
 
     @Override
@@ -306,4 +223,4 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
     protected TypeState newInitialFlow() {
         return new TypeState();
     }
-}
+};

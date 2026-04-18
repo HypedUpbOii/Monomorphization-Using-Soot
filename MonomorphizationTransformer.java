@@ -1,355 +1,265 @@
 import java.util.*;
 
-import soot.Body;
-import soot.Local;
-import soot.Modifier;
-import soot.Scene;
-import soot.SceneTransformer;
-import soot.SootClass;
-import soot.SootField;
-import soot.SootMethod;
-import soot.Type;
-import soot.Unit;
-import soot.Value;
-import soot.jimple.AssignStmt;
-import soot.jimple.IdentityStmt;
-import soot.jimple.InstanceInvokeExpr;
-import soot.jimple.InterfaceInvokeExpr;
-import soot.jimple.InvokeExpr;
-import soot.jimple.InvokeStmt;
-import soot.jimple.Jimple;
-import soot.jimple.ParameterRef;
-import soot.jimple.Stmt;
-import soot.jimple.ThisRef;
-import soot.jimple.VirtualInvokeExpr;
+import soot.*;
+import soot.jimple.*;
+import soot.jimple.internal.JAssignStmt;
+import soot.jimple.internal.JInvokeStmt;
 import soot.jimple.toolkits.callgraph.CallGraph;
 import soot.jimple.toolkits.callgraph.Edge;
 import soot.toolkits.graph.BriefUnitGraph;
 
+// Pair of (method, context) used as a worklist item.
+class Task {
+    SootMethod method;
+    Map<Integer, Set<SootClass>> ctx;
+
+    Task(SootMethod m, Map<Integer, Set<SootClass>> c) {
+        this.method = m;
+        this.ctx = c;
+    }
+};
+
 public class MonomorphizationTransformer extends SceneTransformer {
 
-    // Interprocedural summaries: method → (paramCtx → return types)
-    private final Map<SootMethod, Map<Map<Integer, Set<SootClass>>, Set<SootClass>>> summaries = new HashMap<>();
+    // per-method context-sensitive return-type summaries
+    Map<SootMethod, Map<Map<Integer, Set<SootClass>>, Set<SootClass>>> summaries = new HashMap<>();
+    // union of the receiver types ever observed at each dispatch site
+    Map<SootMethod, Map<Stmt, Set<SootClass>>> receiversAt = new HashMap<>();
+    // cache of already-created static clones
+    Map<SootMethod, Map<SootClass, SootMethod>> clones = new HashMap<>();
 
-    // Accumulated receiver types per call site across all contexts:
-    // method → stmt → union of receiver types seen across all contexts
-    private final Map<SootMethod, Map<Stmt, Set<SootClass>>> receiverTypesPerSite = new HashMap<>();
-
-    // Cache of created static clones: concreteMethod → concreteType → static clone
-    private final Map<SootMethod, Map<SootClass, SootMethod>> monoClones = new HashMap<>();
-
-    // Field-based global: field → union of concrete types ever written to it
-    private final Map<SootField, Set<SootClass>> fieldTypes = new HashMap<>();
-    // Array-element-type-based global: element Type → union of concrete types stored
-    private final Map<Type, Set<SootClass>> arrayElemTypes = new HashMap<>();
+    // heap abstractions
+    Map<SootField, Set<SootClass>> fieldTypes = new HashMap<>();
+    Map<Type, Set<SootClass>> arrayElemTypes = new HashMap<>();
 
     @Override
     protected void internalTransform(String phaseName, Map<String, String> options) {
-        CallGraph callGraph = Scene.v().getCallGraph();
-        List<SootMethod> reachable = collectReachableMethods(callGraph);
+        CallGraph cg = Scene.v().getCallGraph();
+        List<SootMethod> reachable = collectReachable(cg);
 
-        runContextSensitiveAnalysis(reachable);
+        // outer fixed-point: redo the context-sensitive pass until the global
+        // field / array maps stop changing
+        int prevF = -1, prevA = -1;
+        for (int it = 0; it < 10; it++) {
+            runPass(reachable);
+            int f = sizeOf(fieldTypes), a = sizeOf(arrayElemTypes);
+            if (f == prevF && a == prevA) break;
+            prevF = f; prevA = a;
+            if (it == 9) System.err.println("Warning: field/array maps did not converge in 10 iterations");
+        }
 
-        int rewritten = rewriteCallSites(reachable);
-        System.out.println("Monomorphized call sites: " + rewritten);
+        int n = rewrite(reachable);
+        System.out.println("Monomorphized call sites: " + n);
     }
 
-    // -------------------------------------------------------------------------
-    // Interprocedural context-sensitive analysis
-    // -------------------------------------------------------------------------
+    void runPass(List<SootMethod> reachable) {
+        Deque<Task> wl = new ArrayDeque<>();
+        Map<SootMethod, Set<Map<Integer, Set<SootClass>>>> seen = new HashMap<>();
 
-    private void runContextSensitiveAnalysis(List<SootMethod> reachable) {
-        // Outer fixed-point: when field/array global maps grow, re-run the worklist
-        // so that readers of those fields/arrays pick up the newly-known types.
-        int prevFieldSize = -1;
-        int prevArraySize = -1;
-        int iter = 0;
-        int maxIter = 10;
-        while (iter++ < maxIter) {
-            runWorklistOnce(reachable);
-            int fieldSize = totalSize(fieldTypes);
-            int arraySize = totalSize(arrayElemTypes);
-            if (fieldSize == prevFieldSize && arraySize == prevArraySize) break;
-            prevFieldSize = fieldSize;
-            prevArraySize = arraySize;
-        }
-        if (iter > maxIter) {
-            System.err.println("Warning: field/array type sets did not converge after " + maxIter + " iterations");
-        }
-    }
+        for (SootMethod m : reachable) wl.add(new Task(m, new HashMap<>()));
 
-    private void runWorklistOnce(List<SootMethod> reachable) {
-        Deque<AnalysisTask> worklist = new ArrayDeque<>();
-        // Track which (method, context) pairs have already been processed this pass
-        Map<SootMethod, Set<Map<Integer, Set<SootClass>>>> processed = new HashMap<>();
+        while (!wl.isEmpty()) {
+            Task t = wl.removeFirst();
+            SootMethod m = t.method;
+            var ctx = t.ctx;
 
-        // Seed: all reachable application methods with an empty (unknown) context.
-        for (SootMethod m : reachable) {
-            worklist.add(new AnalysisTask(m, new HashMap<>()));
-        }
-
-        while (!worklist.isEmpty()) {
-            AnalysisTask task = worklist.removeFirst();
-            SootMethod method = task.method;
-            Map<Integer, Set<SootClass>> paramCtx = task.paramCtx;
-
-            if (!isAnalyzable(method)) continue;
-
-            Set<Map<Integer, Set<SootClass>>> methodCtxs =
-                processed.computeIfAbsent(method, k -> new HashSet<>());
-            if (!methodCtxs.add(deepCopyContext(paramCtx))) continue;
+            if (!isApp(m)) continue;
+            if (!seen.computeIfAbsent(m, k -> new HashSet<>()).add(deepCopy(ctx))) continue;
 
             Body body;
             try {
-                body = method.retrieveActiveBody();
+                body = m.retrieveActiveBody();
             } catch (RuntimeException e) {
                 continue;
             }
 
             TypeFlowAnalysis tfa = new TypeFlowAnalysis(
-                new BriefUnitGraph(body), paramCtx, summaries, fieldTypes, arrayElemTypes
-            );
+                new BriefUnitGraph(body), ctx, summaries, fieldTypes, arrayElemTypes);
 
-            summaries.computeIfAbsent(method, k -> new HashMap<>())
-                     .put(deepCopyContext(paramCtx), new HashSet<>(tfa.returnTypes));
+            summaries.computeIfAbsent(m, k -> new HashMap<>())
+                     .put(deepCopy(ctx), new HashSet<>(tfa.returnTypes));
 
-            Map<Stmt, Set<SootClass>> sitesForMethod =
-                receiverTypesPerSite.computeIfAbsent(method, k -> new HashMap<>());
-            tfa.receiverTypesAtSite.forEach((stmt, types) ->
-                sitesForMethod.computeIfAbsent(stmt, k -> new HashSet<>()).addAll(types));
+            var sites = receiversAt.computeIfAbsent(m, k -> new HashMap<>());
+            for (var e : tfa.receiverTypesAtSite.entrySet()) {
+                sites.computeIfAbsent(e.getKey(), k -> new HashSet<>()).addAll(e.getValue());
+            }
 
-            for (Map.Entry<Stmt, Map<Integer, Set<SootClass>>> entry : tfa.callSiteArgCtx.entrySet()) {
-                Stmt callSite = entry.getKey();
-                Map<Integer, Set<SootClass>> argCtx = entry.getValue();
-                InvokeExpr ie = callSite.getInvokeExpr();
-
+            // enqueue callees under the contexts discovered here
+            for (var e : tfa.callSiteArgCtx.entrySet()) {
+                Stmt s = e.getKey();
+                var argCtx = e.getValue();
+                InvokeExpr ie = s.getInvokeExpr();
                 if (ie instanceof VirtualInvokeExpr || ie instanceof InterfaceInvokeExpr) {
-                    Set<SootClass> receiverTypes = tfa.receiverTypesAtSite.get(callSite);
-                    if (receiverTypes == null) continue;
-                    for (SootClass receiverType : receiverTypes) {
-                        SootMethod concreteTarget = resolveDispatch(receiverType, ie.getMethod());
-                        if (concreteTarget == null || !isAnalyzable(concreteTarget)) continue;
-                        Map<Integer, Set<SootClass>> calleeCtx = deepCopyContext(argCtx);
-                        calleeCtx.put(-1, Collections.singleton(receiverType));
-                        worklist.add(new AnalysisTask(concreteTarget, calleeCtx));
+                    Set<SootClass> recv = tfa.receiverTypesAtSite.get(s);
+                    if (recv == null) continue;
+                    for (SootClass r : recv) {
+                        SootMethod tgt = resolveConcrete(r, ie.getMethod());
+                        if (tgt == null || !isApp(tgt)) continue;
+                        var nctx = deepCopy(argCtx);
+                        nctx.put(-1, Collections.singleton(r));
+                        wl.add(new Task(tgt, nctx));
                     }
                 } else {
                     SootMethod callee = ie.getMethod();
-                    if (isAnalyzable(callee)) {
-                        worklist.add(new AnalysisTask(callee, deepCopyContext(argCtx)));
-                    }
+                    if (isApp(callee)) wl.add(new Task(callee, deepCopy(argCtx)));
                 }
             }
         }
     }
 
-    private static <K> int totalSize(Map<K, Set<SootClass>> m) {
+    int rewrite(List<SootMethod> reachable) {
         int n = 0;
-        for (Set<SootClass> v : m.values()) n += v.size();
-        return n;
-    }
-
-    // -------------------------------------------------------------------------
-    // Rewriting: VirtualInvokeExpr → StaticInvokeExpr on a cloned static method
-    // -------------------------------------------------------------------------
-
-    private int rewriteCallSites(List<SootMethod> reachable) {
-        int count = 0;
-        for (SootMethod method : reachable) {
-            Map<Stmt, Set<SootClass>> sites = receiverTypesPerSite.get(method);
+        for (SootMethod m : reachable) {
+            Map<Stmt, Set<SootClass>> sites = receiversAt.get(m);
             if (sites == null) continue;
 
             Body body;
             try {
-                body = method.retrieveActiveBody();
+                body = m.retrieveActiveBody();
             } catch (RuntimeException e) {
                 continue;
             }
 
-            for (Unit unit : new ArrayList<>(body.getUnits())) {
-                if (!(unit instanceof Stmt)) continue;
-                Stmt stmt = (Stmt) unit;
-                if (!stmt.containsInvokeExpr()) continue;
-                InvokeExpr invokeExpr = stmt.getInvokeExpr();
-                if (!(invokeExpr instanceof VirtualInvokeExpr || invokeExpr instanceof InterfaceInvokeExpr)) continue;
+            // snapshot the unit chain -- we insert casts while iterating
+            for (Unit u : new ArrayList<>(body.getUnits())) {
+                if (!(u instanceof Stmt)) continue;
+                Stmt s = (Stmt) u;
+                if (!s.containsInvokeExpr()) continue;
+                InvokeExpr ie = s.getInvokeExpr();
+                if (!(ie instanceof VirtualInvokeExpr || ie instanceof InterfaceInvokeExpr)) continue;
 
-                Set<SootClass> receiverTypes = sites.get(stmt);
-                // Only devirtualize if all observed contexts agree on a single concrete type
-                if (receiverTypes == null || receiverTypes.size() != 1) continue;
+                Set<SootClass> recv = sites.get(s);
+                if (recv == null || recv.size() != 1) continue;
 
-                SootClass concreteType = receiverTypes.iterator().next();
-                InstanceInvokeExpr iie = (InstanceInvokeExpr) invokeExpr;
-                SootMethod concreteMethod = resolveDispatch(concreteType, iie.getMethod());
-                if (concreteMethod == null || !concreteMethod.isConcrete()) continue;
-                // Never materialize $mono clones on JDK classes — the JVM loads those
-                // from the boot classpath at runtime and won't see our rewritten copies.
-                if (isJdkClass(concreteMethod.getDeclaringClass())) continue;
+                SootClass concrete = recv.iterator().next();
+                InstanceInvokeExpr iie = (InstanceInvokeExpr) ie;
+                SootMethod target = resolveConcrete(concrete, iie.getMethod());
+                if (target == null || !target.isConcrete()) continue;
 
-                SootMethod staticClone = getOrCreateStaticClone(concreteMethod, concreteType);
+                // boot-loaded JDK classes can't be overridden, so don't create $mono on them
+                if (isJdk(target.getDeclaringClass())) continue;
 
-                // The static clone expects the receiver typed as concreteType. If the
-                // base local has a wider declared type (e.g. an interface), insert a
-                // cast: tmp = (concreteType) base; then pass tmp.
-                Value receiverValue = iie.getBase();
-                if (receiverValue instanceof Local
-                        && !concreteType.getType().equals(((Local) receiverValue).getType())) {
-                    Local castLocal = Jimple.v().newLocal(
-                        "$mono_cast_" + count, concreteType.getType());
-                    body.getLocals().add(castLocal);
-                    AssignStmt castStmt = Jimple.v().newAssignStmt(
-                        castLocal,
-                        Jimple.v().newCastExpr(receiverValue, concreteType.getType()));
-                    body.getUnits().insertBefore(castStmt, stmt);
-                    receiverValue = castLocal;
+                SootMethod clone = getClone(target, concrete);
+
+                // the clone's first param is typed as the concrete class; if the
+                // receiver local is declared as a wider type, cast it first
+                Value base = iie.getBase();
+                if (base instanceof Local && !concrete.getType().equals(((Local) base).getType())) {
+                    Local tmp = Jimple.v().newLocal("$mono_cast_" + n, concrete.getType());
+                    body.getLocals().add(tmp);
+                    AssignStmt cast = Jimple.v().newAssignStmt(
+                        tmp, Jimple.v().newCastExpr(base, concrete.getType()));
+                    body.getUnits().insertBefore(cast, s);
+                    base = tmp;
                 }
 
-                // staticinvoke args: [receiver, originalArg0, originalArg1, ...]
-                List<Value> allArgs = new ArrayList<>();
-                allArgs.add(receiverValue);
-                allArgs.addAll(iie.getArgs());
+                List<Value> args = new ArrayList<>();
+                args.add(base);
+                args.addAll(iie.getArgs());
+                StaticInvokeExpr sie = Jimple.v().newStaticInvokeExpr(clone.makeRef(), args);
 
-                soot.jimple.StaticInvokeExpr staticExpr =
-                    Jimple.v().newStaticInvokeExpr(staticClone.makeRef(), allArgs);
+                if (s instanceof JAssignStmt) ((JAssignStmt) s).setRightOp(sie);
+                else if (s instanceof JInvokeStmt) ((JInvokeStmt) s).setInvokeExpr(sie);
 
-                if (stmt instanceof AssignStmt) {
-                    ((AssignStmt) stmt).setRightOp(staticExpr);
-                } else if (stmt instanceof InvokeStmt) {
-                    ((InvokeStmt) stmt).setInvokeExpr(staticExpr);
-                }
-
-                int line = stmt.getJavaSourceStartLineNumber();
-                if (line > 0) {
-                    System.out.printf("%03d -> %s%n", line, staticClone.getSignature());
-                }
-                count++;
+                int line = s.getJavaSourceStartLineNumber();
+                if (line > 0) System.out.printf("%03d -> %s%n", line, clone.getSignature());
+                n++;
             }
         }
-        return count;
+        return n;
     }
 
-    private SootMethod getOrCreateStaticClone(SootMethod concreteMethod, SootClass concreteType) {
-        return monoClones
-            .computeIfAbsent(concreteMethod, k -> new HashMap<>())
-            .computeIfAbsent(concreteType, cls -> createStaticClone(concreteMethod, cls));
+    SootMethod getClone(SootMethod tgt, SootClass concrete) {
+        return clones
+            .computeIfAbsent(tgt, k -> new HashMap<>())
+            .computeIfAbsent(concrete, k -> makeClone(tgt, concrete));
     }
 
-    private SootMethod createStaticClone(SootMethod concreteMethod, SootClass concreteType) {
-        // Parameter list: concreteType (the receiver) followed by the original parameters
-        List<Type> paramTypes = new ArrayList<>();
-        paramTypes.add(concreteType.getType());
-        paramTypes.addAll(concreteMethod.getParameterTypes());
+    SootMethod makeClone(SootMethod tgt, SootClass concrete) {
+        List<Type> params = new ArrayList<>();
+        params.add(concrete.getType());
+        params.addAll(tgt.getParameterTypes());
 
-        String cloneName = concreteMethod.getName() + "$mono$" + concreteType.getShortJavaStyleName();
-        int modifiers = (concreteMethod.getModifiers() | Modifier.STATIC) & ~Modifier.ABSTRACT & ~Modifier.NATIVE;
+        String name = tgt.getName() + "$mono$" + concrete.getShortJavaStyleName();
+        int mods = (tgt.getModifiers() | Modifier.STATIC) & ~Modifier.ABSTRACT & ~Modifier.NATIVE;
 
-        SootMethod staticMethod = new SootMethod(
-            cloneName, paramTypes, concreteMethod.getReturnType(), modifiers
-        );
-        concreteMethod.getDeclaringClass().addMethod(staticMethod);
+        SootMethod out = new SootMethod(name, params, tgt.getReturnType(), mods);
+        tgt.getDeclaringClass().addMethod(out);
 
-        // Clone the body, then fix up identity statements
-        Body originalBody = concreteMethod.retrieveActiveBody();
-        Body newBody = Jimple.v().newBody(staticMethod);
-        newBody.importBodyContentsFrom(originalBody);
+        Body src = tgt.retrieveActiveBody();
+        Body dst = Jimple.v().newBody(out);
+        dst.importBodyContentsFrom(src);
 
-        // @this: T         → @parameter0: concreteType
-        // @parameterN: T   → @parameter(N+1): T
-        for (Unit unit : newBody.getUnits()) {
-            if (!(unit instanceof IdentityStmt)) continue;
-            IdentityStmt id = (IdentityStmt) unit;
-            Value rhs = id.getRightOp();
-            if (rhs instanceof ThisRef) {
-                id.setRightOp(Jimple.v().newParameterRef(concreteType.getType(), 0));
-            } else if (rhs instanceof ParameterRef) {
-                ParameterRef pr = (ParameterRef) rhs;
+        // rewire @this -> @parameter0, and push every @parameterN down by one
+        for (Unit u : dst.getUnits()) {
+            if (!(u instanceof IdentityStmt)) continue;
+            IdentityStmt id = (IdentityStmt) u;
+            Value r = id.getRightOp();
+            if (r instanceof ThisRef) {
+                id.setRightOp(Jimple.v().newParameterRef(concrete.getType(), 0));
+            } else if (r instanceof ParameterRef) {
+                ParameterRef pr = (ParameterRef) r;
                 id.setRightOp(Jimple.v().newParameterRef(pr.getType(), pr.getIndex() + 1));
             }
         }
-
-        staticMethod.setActiveBody(newBody);
-        return staticMethod;
+        out.setActiveBody(dst);
+        return out;
     }
 
-    // -------------------------------------------------------------------------
-    // Helpers
-    // -------------------------------------------------------------------------
-
-    private static boolean isJdkClass(SootClass sc) {
-        String n = sc.getName();
+    static boolean isJdk(SootClass c) {
+        String n = c.getName();
         return n.startsWith("java.") || n.startsWith("javax.")
             || n.startsWith("sun.")  || n.startsWith("jdk.")
             || n.startsWith("com.sun.");
     }
 
-    private SootMethod resolveDispatch(SootClass receiverType, SootMethod virtualMethod) {
+    SootMethod resolveConcrete(SootClass recv, SootMethod m) {
         try {
-            return Scene.v().getOrMakeFastHierarchy()
-                       .resolveConcreteDispatch(receiverType, virtualMethod);
+            return Scene.v().getOrMakeFastHierarchy().resolveConcreteDispatch(recv, m);
         } catch (Exception e) {
             return null;
         }
     }
 
-    private boolean isAnalyzable(SootMethod m) {
-        return m.isConcrete()
-            && !m.isAbstract()
-            && m.getDeclaringClass().isApplicationClass();
+    boolean isApp(SootMethod m) {
+        return m.isConcrete() && !m.isAbstract() && m.getDeclaringClass().isApplicationClass();
     }
 
-    private List<SootMethod> collectReachableMethods(CallGraph callGraph) {
-        List<SootMethod> reachable = new ArrayList<>();
-        Set<SootMethod> visited = new HashSet<>();
-        Deque<SootMethod> worklist = new ArrayDeque<>(Scene.v().getEntryPoints());
-
-        while (!worklist.isEmpty()) {
-            SootMethod current = worklist.removeFirst();
-            if (!visited.add(current)) continue;
-            if (!current.getDeclaringClass().isApplicationClass()) continue;
-
-            reachable.add(current);
+    List<SootMethod> collectReachable(CallGraph cg) {
+        List<SootMethod> out = new ArrayList<>();
+        Set<SootMethod> seen = new HashSet<>();
+        Deque<SootMethod> wl = new ArrayDeque<>(Scene.v().getEntryPoints());
+        while (!wl.isEmpty()) {
+            SootMethod cur = wl.removeFirst();
+            if (!seen.add(cur)) continue;
+            if (!cur.getDeclaringClass().isApplicationClass()) continue;
+            out.add(cur);
 
             Body body;
-            try {
-                body = current.retrieveActiveBody();
-            } catch (RuntimeException e) {
-                continue;
-            }
-
-            for (Unit unit : body.getUnits()) {
-                if (!(unit instanceof Stmt)) continue;
-                Stmt stmt = (Stmt) unit;
-                if (!stmt.containsInvokeExpr()) continue;
-
-                Iterator<Edge> outEdges = callGraph.edgesOutOf(stmt);
-                while (outEdges.hasNext()) {
-                    SootMethod target = outEdges.next().tgt();
-                    if (target.getDeclaringClass().isApplicationClass()) {
-                        worklist.addLast(target);
-                    }
+            try { body = cur.retrieveActiveBody(); } catch (RuntimeException e) { continue; }
+            for (Unit u : body.getUnits()) {
+                if (!(u instanceof Stmt)) continue;
+                Stmt s = (Stmt) u;
+                if (!s.containsInvokeExpr()) continue;
+                Iterator<Edge> it = cg.edgesOutOf(s);
+                while (it.hasNext()) {
+                    SootMethod t = it.next().tgt();
+                    if (t.getDeclaringClass().isApplicationClass()) wl.addLast(t);
                 }
             }
         }
-
-        return reachable;
+        return out;
     }
 
-    private static Map<Integer, Set<SootClass>> deepCopyContext(Map<Integer, Set<SootClass>> ctx) {
-        Map<Integer, Set<SootClass>> copy = new HashMap<>();
-        ctx.forEach((k, v) -> copy.put(k, new HashSet<>(v)));
-        return copy;
+    static Map<Integer, Set<SootClass>> deepCopy(Map<Integer, Set<SootClass>> ctx) {
+        Map<Integer, Set<SootClass>> out = new HashMap<>();
+        for (var e : ctx.entrySet()) out.put(e.getKey(), new HashSet<>(e.getValue()));
+        return out;
     }
 
-    // -------------------------------------------------------------------------
-    // AnalysisTask: worklist item pairing a method with its calling context
-    // -------------------------------------------------------------------------
-
-    private static class AnalysisTask {
-        final SootMethod method;
-        final Map<Integer, Set<SootClass>> paramCtx;
-
-        AnalysisTask(SootMethod method, Map<Integer, Set<SootClass>> paramCtx) {
-            this.method = method;
-            this.paramCtx = paramCtx;
-        }
+    static <K> int sizeOf(Map<K, Set<SootClass>> m) {
+        int n = 0;
+        for (Set<SootClass> v : m.values()) n += v.size();
+        return n;
     }
 }

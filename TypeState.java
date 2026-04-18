@@ -1,46 +1,55 @@
 import java.util.*;
 
-import soot.Local;
-import soot.SootClass;
+import soot.*;
 
 public class TypeState {
-    // Maps each local to the set of concrete classes it may refer to at this point.
-    // Absence means we have no type information (unknown / not yet seen allocated).
-    final Map<Local, Set<SootClass>> pointsTo = new HashMap<>();
+    Map<Local, Set<SootClass>> pts;
+
+    TypeState() {
+        this.pts = new HashMap<>();
+    }
 
     Set<SootClass> get(Local l) {
-        return pointsTo.getOrDefault(l, Collections.emptySet());
+        if (!pts.containsKey(l)) return Collections.emptySet();
+        return pts.get(l);
     }
 
     void set(Local l, Set<SootClass> types) {
-        if (types.isEmpty()) {
-            pointsTo.remove(l);
-        } else {
-            pointsTo.put(l, new HashSet<>(types));
+        if (types == null || types.isEmpty()) {
+            pts.remove(l);
+            return;
+        }
+        pts.put(l, new HashSet<>(types));
+    }
+
+    void copy(TypeState dst) {
+        dst.pts.clear();
+        for (var e : pts.entrySet()) {
+            dst.pts.put(e.getKey(), new HashSet<>(e.getValue()));
         }
     }
 
-    void add(Local l, SootClass type) {
-        pointsTo.computeIfAbsent(l, k -> new HashSet<>()).add(type);
-    }
-
-    void copyFrom(TypeState other) {
-        pointsTo.clear();
-        other.pointsTo.forEach((l, types) -> pointsTo.put(l, new HashSet<>(types)));
-    }
-
-    void unionFrom(TypeState other) {
-        other.pointsTo.forEach((l, types) ->
-            pointsTo.computeIfAbsent(l, k -> new HashSet<>()).addAll(types));
+    void union(TypeState other, TypeState dst) {
+        dst.pts.clear();
+        Set<Local> all = new HashSet<>();
+        all.addAll(this.pts.keySet());
+        all.addAll(other.pts.keySet());
+        for (Local l : all) {
+            Set<SootClass> u = new HashSet<>();
+            if (this.pts.containsKey(l))  u.addAll(this.pts.get(l));
+            if (other.pts.containsKey(l)) u.addAll(other.pts.get(l));
+            if (!u.isEmpty()) dst.pts.put(l, u);
+        }
     }
 
     @Override
     public boolean equals(Object o) {
-        return o instanceof TypeState && pointsTo.equals(((TypeState) o).pointsTo);
+        if (!(o instanceof TypeState)) return false;
+        return ((TypeState) o).pts.equals(this.pts);
     }
 
     @Override
     public int hashCode() {
-        return pointsTo.hashCode();
+        return pts.hashCode();
     }
-}
+};
