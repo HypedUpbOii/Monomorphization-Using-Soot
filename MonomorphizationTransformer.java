@@ -36,13 +36,16 @@ public class MonomorphizationTransformer extends SceneTransformer {
         CallGraph cg = Scene.v().getCallGraph();
         List<SootMethod> reachable = collectReachable(cg);
 
-        // outer fixed-point: redo the context-sensitive pass until the global field / array maps stop changing
+        // outer fixed-point: redo the context-sensitive pass until the global field /
+        // array maps stop changing
         int prevF = -1, prevA = -1;
         for (int it = 0; it < 10; it++) {
             runPass(reachable);
             int f = sizeOf(fieldTypes), a = sizeOf(arrayElemTypes);
-            if (f == prevF && a == prevA) break;
-            prevF = f; prevA = a;
+            if (f == prevF && a == prevA)
+                break;
+            prevF = f;
+            prevA = a;
         }
 
         int n = rewrite(reachable);
@@ -53,23 +56,26 @@ public class MonomorphizationTransformer extends SceneTransformer {
         Deque<Task> wl = new ArrayDeque<>();
         Map<SootMethod, Set<Map<Integer, Set<SootClass>>>> seen = new HashMap<>();
 
-        for (SootMethod m : reachable) wl.add(new Task(m, new HashMap<>()));
+        for (SootMethod m : reachable)
+            wl.add(new Task(m, new HashMap<>()));
 
         while (!wl.isEmpty()) {
             Task t = wl.removeFirst();
             SootMethod m = t.method;
             var ctx = t.ctx;
 
-            if (!isApp(m)) continue;
-            if (!seen.computeIfAbsent(m, k -> new HashSet<>()).add(deepCopy(ctx))) continue;
+            if (!isApp(m))
+                continue;
+            if (!seen.computeIfAbsent(m, k -> new HashSet<>()).add(deepCopy(ctx)))
+                continue;
 
             Body body = m.retrieveActiveBody();
-            
+
             TypeFlowAnalysis tfa = new TypeFlowAnalysis(
-                new BriefUnitGraph(body), ctx, summaries, fieldTypes, arrayElemTypes);
+                    new BriefUnitGraph(body), ctx, summaries, fieldTypes, arrayElemTypes);
 
             summaries.computeIfAbsent(m, k -> new HashMap<>())
-                     .put(deepCopy(ctx), new HashSet<>(tfa.returnTypes));
+                    .put(deepCopy(ctx), new HashSet<>(tfa.returnTypes));
 
             var sites = receiversAt.computeIfAbsent(m, k -> new HashMap<>());
             for (var e : tfa.receiverTypesAtSite.entrySet()) {
@@ -83,17 +89,20 @@ public class MonomorphizationTransformer extends SceneTransformer {
                 InvokeExpr ie = s.getInvokeExpr();
                 if (ie instanceof VirtualInvokeExpr || ie instanceof InterfaceInvokeExpr) {
                     Set<SootClass> recv = tfa.receiverTypesAtSite.get(s);
-                    if (recv == null) continue;
+                    if (recv == null)
+                        continue;
                     for (SootClass r : recv) {
                         SootMethod tgt = resolveConcrete(r, ie.getMethod());
-                        if (tgt == null || !isApp(tgt)) continue;
+                        if (tgt == null || !isApp(tgt))
+                            continue;
                         var nctx = deepCopy(argCtx);
                         nctx.put(-1, Collections.singleton(r));
                         wl.add(new Task(tgt, nctx));
                     }
                 } else {
                     SootMethod callee = ie.getMethod();
-                    if (isApp(callee)) wl.add(new Task(callee, deepCopy(argCtx)));
+                    if (isApp(callee))
+                        wl.add(new Task(callee, deepCopy(argCtx)));
                 }
             }
         }
@@ -103,28 +112,35 @@ public class MonomorphizationTransformer extends SceneTransformer {
         int n = 0;
         for (SootMethod m : reachable) {
             Map<Stmt, Set<SootClass>> sites = receiversAt.get(m);
-            if (sites == null) continue;
+            if (sites == null)
+                continue;
 
             Body body = m.retrieveActiveBody();
-    
+
             // snapshot the unit chain -- we insert casts while iterating
             for (Unit u : new ArrayList<>(body.getUnits())) {
-                if (!(u instanceof Stmt)) continue;
+                if (!(u instanceof Stmt))
+                    continue;
                 Stmt s = (Stmt) u;
-                if (!s.containsInvokeExpr()) continue;
+                if (!s.containsInvokeExpr())
+                    continue;
                 InvokeExpr ie = s.getInvokeExpr();
-                if (!(ie instanceof VirtualInvokeExpr || ie instanceof InterfaceInvokeExpr)) continue;
+                if (!(ie instanceof VirtualInvokeExpr || ie instanceof InterfaceInvokeExpr))
+                    continue;
 
                 Set<SootClass> recv = sites.get(s);
-                if (recv == null || recv.size() != 1) continue;
+                if (recv == null || recv.size() != 1)
+                    continue;
 
                 SootClass concrete = recv.iterator().next();
                 InstanceInvokeExpr iie = (InstanceInvokeExpr) ie;
                 SootMethod target = resolveConcrete(concrete, iie.getMethod());
-                if (target == null || !target.isConcrete()) continue;
+                if (target == null || !target.isConcrete())
+                    continue;
 
                 // loaded JDK classes can't be overridden, so don't create $mono on them
-                if (isJdk(target.getDeclaringClass())) continue;
+                if (isJdk(target.getDeclaringClass()))
+                    continue;
 
                 SootMethod clone = getClone(target, concrete);
 
@@ -135,7 +151,7 @@ public class MonomorphizationTransformer extends SceneTransformer {
                     Local tmp = Jimple.v().newLocal("$mono_cast_" + n, concrete.getType());
                     body.getLocals().add(tmp);
                     AssignStmt cast = Jimple.v().newAssignStmt(
-                        tmp, Jimple.v().newCastExpr(base, concrete.getType()));
+                            tmp, Jimple.v().newCastExpr(base, concrete.getType()));
                     body.getUnits().insertBefore(cast, s);
                     base = tmp;
                 }
@@ -145,11 +161,14 @@ public class MonomorphizationTransformer extends SceneTransformer {
                 args.addAll(iie.getArgs());
                 StaticInvokeExpr sie = Jimple.v().newStaticInvokeExpr(clone.makeRef(), args);
 
-                if (s instanceof JAssignStmt) ((JAssignStmt) s).setRightOp(sie);
-                else if (s instanceof JInvokeStmt) ((JInvokeStmt) s).setInvokeExpr(sie);
+                if (s instanceof JAssignStmt)
+                    ((JAssignStmt) s).setRightOp(sie);
+                else if (s instanceof JInvokeStmt)
+                    ((JInvokeStmt) s).setInvokeExpr(sie);
 
                 int line = s.getJavaSourceStartLineNumber();
-                if (line > 0) System.out.printf("%03d -> %s%n", line, clone.getSignature());
+                if (line > 0)
+                    System.out.printf("%03d -> %s%n", line, clone.getSignature());
                 n++;
             }
         }
@@ -157,7 +176,8 @@ public class MonomorphizationTransformer extends SceneTransformer {
     }
 
     SootMethod getClone(SootMethod tgt, SootClass concrete) {
-        return clones.computeIfAbsent(tgt, k -> new HashMap<>()).computeIfAbsent(concrete, k -> makeClone(tgt, concrete));
+        return clones.computeIfAbsent(tgt, k -> new HashMap<>()).computeIfAbsent(concrete,
+                k -> makeClone(tgt, concrete));
     }
 
     SootMethod makeClone(SootMethod tgt, SootClass concrete) {
@@ -177,7 +197,8 @@ public class MonomorphizationTransformer extends SceneTransformer {
 
         // rewire @this -> @parameter0, and push every @parameterN down by one
         for (Unit u : dst.getUnits()) {
-            if (!(u instanceof IdentityStmt)) continue;
+            if (!(u instanceof IdentityStmt))
+                continue;
             IdentityStmt id = (IdentityStmt) u;
             Value r = id.getRightOp();
             if (r instanceof ThisRef) {
@@ -194,11 +215,11 @@ public class MonomorphizationTransformer extends SceneTransformer {
     static boolean isJdk(SootClass c) {
         String n = c.getName();
         return n.startsWith("java.") || n.startsWith("javax.")
-            || n.startsWith("sun.")  || n.startsWith("jdk.")
-            || n.startsWith("com.sun.");
+                || n.startsWith("sun.") || n.startsWith("jdk.")
+                || n.startsWith("com.sun.");
     }
 
-    SootMethod resolveConcrete(SootClass recv, SootMethod m) {    
+    SootMethod resolveConcrete(SootClass recv, SootMethod m) {
         return Scene.v().getOrMakeFastHierarchy().resolveConcreteDispatch(recv, m);
     }
 
@@ -212,19 +233,24 @@ public class MonomorphizationTransformer extends SceneTransformer {
         Deque<SootMethod> wl = new ArrayDeque<>(Scene.v().getEntryPoints());
         while (!wl.isEmpty()) {
             SootMethod cur = wl.removeFirst();
-            if (!seen.add(cur)) continue;
-            if (!cur.getDeclaringClass().isApplicationClass()) continue;
+            if (!seen.add(cur))
+                continue;
+            if (!cur.getDeclaringClass().isApplicationClass())
+                continue;
             out.add(cur);
 
-            Body body = cur.retrieveActiveBody(); 
+            Body body = cur.retrieveActiveBody();
             for (Unit u : body.getUnits()) {
-                if (!(u instanceof Stmt)) continue;
+                if (!(u instanceof Stmt))
+                    continue;
                 Stmt s = (Stmt) u;
-                if (!s.containsInvokeExpr()) continue;
+                if (!s.containsInvokeExpr())
+                    continue;
                 Iterator<Edge> it = cg.edgesOutOf(s);
                 while (it.hasNext()) {
                     SootMethod t = it.next().tgt();
-                    if (t.getDeclaringClass().isApplicationClass()) wl.addLast(t);
+                    if (t.getDeclaringClass().isApplicationClass())
+                        wl.addLast(t);
                 }
             }
         }
@@ -233,13 +259,15 @@ public class MonomorphizationTransformer extends SceneTransformer {
 
     static Map<Integer, Set<SootClass>> deepCopy(Map<Integer, Set<SootClass>> ctx) {
         Map<Integer, Set<SootClass>> out = new HashMap<>();
-        for (var e : ctx.entrySet()) out.put(e.getKey(), new HashSet<>(e.getValue()));
+        for (var e : ctx.entrySet())
+            out.put(e.getKey(), new HashSet<>(e.getValue()));
         return out;
     }
 
     static <K> int sizeOf(Map<K, Set<SootClass>> m) {
         int n = 0;
-        for (Set<SootClass> v : m.values()) n += v.size();
+        for (Set<SootClass> v : m.values())
+            n += v.size();
         return n;
     }
 }

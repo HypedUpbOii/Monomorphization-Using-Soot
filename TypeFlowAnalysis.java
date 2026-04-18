@@ -9,12 +9,12 @@ import soot.toolkits.scalar.ForwardFlowAnalysis;
 public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
 
     // caller-provided parameter types: index -> types (-1 is the receiver)
-    Map<Integer, Set<SootClass>> paramCtx;
     // method -> (ctx -> set of classes returned by that method under that ctx)
-    Map<SootMethod, Map<Map<Integer, Set<SootClass>>, Set<SootClass>>> summaries;
     // field -> union of types stored into it anywhere in the program so far
-    Map<SootField, Set<SootClass>> fieldTypes;
     // array element type -> union of types stored into arrays of that element type
+    Map<Integer, Set<SootClass>> paramCtx;
+    Map<SootMethod, Map<Map<Integer, Set<SootClass>>, Set<SootClass>>> summaries;
+    Map<SootField, Set<SootClass>> fieldTypes;
     Map<Type, Set<SootClass>> arrayElemTypes;
 
     Map<Local, Integer> paramOf = new HashMap<>();
@@ -25,10 +25,10 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
     Set<SootClass> returnTypes = new HashSet<>();
 
     public TypeFlowAnalysis(DirectedGraph<Unit> g,
-                            Map<Integer, Set<SootClass>> paramCtx,
-                            Map<SootMethod, Map<Map<Integer, Set<SootClass>>, Set<SootClass>>> summaries,
-                            Map<SootField, Set<SootClass>> fieldTypes,
-                            Map<Type, Set<SootClass>> arrayElemTypes) {
+            Map<Integer, Set<SootClass>> paramCtx,
+            Map<SootMethod, Map<Map<Integer, Set<SootClass>>, Set<SootClass>>> summaries,
+            Map<SootField, Set<SootClass>> fieldTypes,
+            Map<Type, Set<SootClass>> arrayElemTypes) {
         super(g);
         this.paramCtx = paramCtx;
         this.summaries = summaries;
@@ -36,13 +36,17 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
         this.arrayElemTypes = arrayElemTypes;
 
         for (Unit u : g) {
-            if (!(u instanceof IdentityStmt)) continue;
+            if (!(u instanceof IdentityStmt))
+                continue;
             IdentityStmt id = (IdentityStmt) u;
-            if (!(id.getLeftOp() instanceof Local)) continue;
+            if (!(id.getLeftOp() instanceof Local))
+                continue;
             Local l = (Local) id.getLeftOp();
             Value r = id.getRightOp();
-            if (r instanceof ThisRef) paramOf.put(l, -1);
-            else if (r instanceof ParameterRef) paramOf.put(l, ((ParameterRef) r).getIndex());
+            if (r instanceof ThisRef)
+                paramOf.put(l, -1);
+            else if (r instanceof ParameterRef)
+                paramOf.put(l, ((ParameterRef) r).getIndex());
         }
 
         doAnalysis();
@@ -51,7 +55,8 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
 
     private void finalizeResults() {
         for (Unit tail : graph.getTails()) {
-            if (!(tail instanceof ReturnStmt)) continue;
+            if (!(tail instanceof ReturnStmt))
+                continue;
             Value op = ((ReturnStmt) tail).getOp();
             if (op instanceof Local) {
                 returnTypes.addAll(getFlowBefore(tail).get((Local) op));
@@ -59,9 +64,11 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
         }
 
         for (Unit u : graph) {
-            if (!(u instanceof Stmt)) continue;
+            if (!(u instanceof Stmt))
+                continue;
             Stmt s = (Stmt) u;
-            if (!s.containsInvokeExpr()) continue;
+            if (!s.containsInvokeExpr())
+                continue;
 
             TypeState before = getFlowBefore(u);
             InvokeExpr ie = s.getInvokeExpr();
@@ -72,23 +79,28 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
                 Value base = ((InstanceInvokeExpr) ie).getBase();
                 if (base instanceof Local) {
                     Set<SootClass> t = before.get((Local) base);
-                    if (!t.isEmpty()) ctx.put(-1, new HashSet<>(t));
+                    if (!t.isEmpty())
+                        ctx.put(-1, new HashSet<>(t));
                 }
             }
             for (int i = 0; i < ie.getArgCount(); i++) {
                 Value a = ie.getArg(i);
-                if (!(a instanceof Local)) continue;
+                if (!(a instanceof Local))
+                    continue;
                 Set<SootClass> t = before.get((Local) a);
-                if (!t.isEmpty()) ctx.put(i, new HashSet<>(t));
+                if (!t.isEmpty())
+                    ctx.put(i, new HashSet<>(t));
             }
-            if (!ctx.isEmpty()) callSiteArgCtx.put(s, ctx);
+            if (!ctx.isEmpty())
+                callSiteArgCtx.put(s, ctx);
 
             // dispatched calls: remember what the receiver can be
             if (ie instanceof VirtualInvokeExpr || ie instanceof InterfaceInvokeExpr) {
                 Value base = ((InstanceInvokeExpr) ie).getBase();
                 if (base instanceof Local) {
                     Set<SootClass> t = before.get((Local) base);
-                    if (!t.isEmpty()) receiverTypesAtSite.put(s, new HashSet<>(t));
+                    if (!t.isEmpty())
+                        receiverTypesAtSite.put(s, new HashSet<>(t));
                 }
             }
         }
@@ -100,39 +112,48 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
 
         if (u instanceof IdentityStmt) {
             IdentityStmt id = (IdentityStmt) u;
-            if (!(id.getLeftOp() instanceof Local)) return;
+            if (!(id.getLeftOp() instanceof Local))
+                return;
             Local l = (Local) id.getLeftOp();
             Integer idx = paramOf.get(l);
-            if (idx == null) return;
+            if (idx == null)
+                return;
             Set<SootClass> t = paramCtx.get(idx);
-            if (t != null && !t.isEmpty()) out.set(l, t);
+            if (t != null && !t.isEmpty())
+                out.set(l, t);
             return;
         }
 
-        if (!(u instanceof JAssignStmt)) return;
+        if (!(u instanceof JAssignStmt))
+            return;
         JAssignStmt stmt = (JAssignStmt) u;
         Value lhs = stmt.getLeftOp();
         Value rhs = stmt.getRightOp();
 
         // stores into fields / arrays: accumulate into the global table
         if (lhs instanceof FieldRef) {
-            if (!(rhs instanceof Local)) return;
+            if (!(rhs instanceof Local))
+                return;
             Set<SootClass> t = out.get((Local) rhs);
-            if (t.isEmpty()) return;
+            if (t.isEmpty())
+                return;
             SootField f = ((FieldRef) lhs).getField();
             fieldTypes.computeIfAbsent(f, k -> new HashSet<>()).addAll(t);
             return;
         }
         if (lhs instanceof ArrayRef) {
-            if (!(rhs instanceof Local)) return;
+            if (!(rhs instanceof Local))
+                return;
             Set<SootClass> t = out.get((Local) rhs);
-            if (t.isEmpty()) return;
+            if (t.isEmpty())
+                return;
             Type et = ((ArrayRef) lhs).getType();
             arrayElemTypes.computeIfAbsent(et, k -> new HashSet<>()).addAll(t);
             return;
         }
 
-        if (!(lhs instanceof Local)) return;
+        if (!(lhs instanceof Local))
+            return;
         Local left = (Local) lhs;
 
         if (rhs instanceof NewExpr) {
@@ -143,15 +164,19 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
 
         if (rhs instanceof CastExpr) {
             CastExpr ce = (CastExpr) rhs;
-            if (!(ce.getOp() instanceof Local)) return;
-            if (!(ce.getCastType() instanceof RefType)) return;
+            if (!(ce.getOp() instanceof Local))
+                return;
+            if (!(ce.getCastType() instanceof RefType))
+                return;
             SootClass target = ((RefType) ce.getCastType()).getSootClass();
             FastHierarchy fh = Scene.v().getOrMakeFastHierarchy();
             Set<SootClass> keep = new HashSet<>();
             for (SootClass c : out.get((Local) ce.getOp())) {
-                if (fh.canStoreClass(c, target)) keep.add(c);
+                if (fh.canStoreClass(c, target))
+                    keep.add(c);
             }
-            if (!keep.isEmpty()) out.set(left, keep);
+            if (!keep.isEmpty())
+                out.set(left, keep);
             return;
         }
 
@@ -163,24 +188,29 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
         if (rhs instanceof InvokeExpr) {
             InvokeExpr ie = (InvokeExpr) rhs;
             var calleeSummary = summaries.get(ie.getMethod());
-            if (calleeSummary == null || calleeSummary.isEmpty()) return;
+            if (calleeSummary == null || calleeSummary.isEmpty())
+                return;
 
             Map<Integer, Set<SootClass>> ctx = new HashMap<>();
             if (ie instanceof InstanceInvokeExpr) {
                 Value base = ((InstanceInvokeExpr) ie).getBase();
                 if (base instanceof Local) {
                     Set<SootClass> t = out.get((Local) base);
-                    if (!t.isEmpty()) ctx.put(-1, new HashSet<>(t));
+                    if (!t.isEmpty())
+                        ctx.put(-1, new HashSet<>(t));
                 }
             }
             for (int i = 0; i < ie.getArgCount(); i++) {
                 Value a = ie.getArg(i);
-                if (!(a instanceof Local)) continue;
+                if (!(a instanceof Local))
+                    continue;
                 Set<SootClass> t = out.get((Local) a);
-                if (!t.isEmpty()) ctx.put(i, new HashSet<>(t));
+                if (!t.isEmpty())
+                    ctx.put(i, new HashSet<>(t));
             }
             Set<SootClass> ret = calleeSummary.get(ctx);
-            if (ret != null && !ret.isEmpty()) out.set(left, ret);
+            if (ret != null && !ret.isEmpty())
+                out.set(left, ret);
             return;
         }
 

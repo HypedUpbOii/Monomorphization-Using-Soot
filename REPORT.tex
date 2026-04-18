@@ -273,25 +273,34 @@ shifted to \texttt{@parameter(N+1): U}.
 
 \subsection{Functional correctness}
 
-Four purpose-built micro testcases exercise the new capabilities. For
-each, the original bytecode (JVM baseline) and the monomorphized
-bytecode (after applying the transformer, then running the emitted
-\texttt{.class} files) are executed and their stdout compared.
+Ten purpose-built testcases exercise the new capabilities. For each, the
+original bytecode (JVM baseline) and the monomorphized bytecode (after
+applying the transformer, then running the emitted \texttt{.class}
+files) are executed and their stdout compared.
 
-\begin{table}[h]
+\begin{table}[ht]
 \centering
-\small
-\begin{tabular}{@{}lllccc@{}}
+\footnotesize
+\setlength{\tabcolsep}{4pt}
+\begin{tabular}{@{}llllcc@{}}
 \toprule
-Test case            & Exercised feature                         & JVM   & After mono & Match & Sites \\
+Test case & Exercised feature & JVM & After mono & Match & Sites \\
 \midrule
-\texttt{field\_case}        & interface dispatch via instance field      & woof  & woof       & \checkmark & 3 \\
-\texttt{array\_case}        & interface dispatch via array element       & 29    & 29         & \checkmark & 1 \\
-\texttt{mixed\_case}        & array held inside an instance field        & RR    & RR         & \checkmark & 5 \\
-\texttt{static\_field\_case}& static field written/read across methods   & hello & hello      & \checkmark & 1 \\
+\texttt{test1}  & interface dispatch via instance field            & woof      & woof      & \checkmark & 3 \\
+\texttt{test2}  & interface dispatch via array element             & 29        & 29        & \checkmark & 1 \\
+\texttt{test3}  & array held inside an instance field              & RR        & RR        & \checkmark & 5 \\
+\texttt{test4}  & static field written / read across methods       & hello     & hello     & \checkmark & 1 \\
+\texttt{test5}  & linked list, dispatch on op field of each node   & 13        & 13        & \checkmark & 1 \\
+\texttt{test6}  & field-of-field: \texttt{box.inner.op.apply()}    & 42        & 42        & \checkmark & 1 \\
+\texttt{test7}  & factory return stored in a field, then dispatch  & $-7$      & $-7$      & \checkmark & 3 \\
+\texttt{test8}  & tight loop through field dispatch                & 400000000 & 400000000 & \checkmark & 3 \\
+\texttt{test9}  & tight loop through array-element dispatch        & 400000000 & 400000000 & \checkmark & 1 \\
+\texttt{test10} & tight loop through array inside a field          & 400000000 & 400000000 & \checkmark & 2 \\
 \bottomrule
 \end{tabular}
-\caption{Functional correctness: all outputs match the JVM baseline.}
+\caption{Functional correctness across all ten testcases: every stdout
+matches the JVM baseline; ``Sites'' is the number of call sites
+devirtualized by the transformer on that testcase.}
 \end{table}
 
 Disassembly (\texttt{javap -c}) confirms each devirtualized call site is
@@ -310,11 +319,11 @@ feature under test.
 \small
 \begin{tabular}{@{}lrrrrr@{}}
 \toprule
-Microbench         & Sites & Baseline (s) & Optimized (s) & $\Delta$ & Speedup \\
+Microbench              & Sites & Baseline (s) & Optimized (s) & $\Delta$ & Speedup \\
 \midrule
-\texttt{bench\_array} & 1  & 7.86  & 6.89  & $+12.3\%$ & $1.14\times$ \\
-\texttt{bench\_mixed} & 2  & 8.50  & 8.56  & $-0.7\%$  & $0.99\times$ \\
-\texttt{bench\_field} & 3  & 12.28 & 13.07 & $-6.4\%$  & $0.94\times$ \\
+\texttt{test9} (array)  & 1  & 7.86  & 6.89  & $+12.3\%$ & $1.14\times$ \\
+\texttt{test10} (mixed) & 2  & 8.50  & 8.56  & $-0.7\%$  & $0.99\times$ \\
+\texttt{test8} (field)  & 3  & 12.28 & 13.07 & $-6.4\%$  & $0.94\times$ \\
 \bottomrule
 \end{tabular}
 \caption{Micro-benchmarks, pure interpreter mode.}
@@ -323,9 +332,9 @@ Microbench         & Sites & Baseline (s) & Optimized (s) & $\Delta$ & Speedup \
 Under \texttt{-Xint} the only saving is
 \texttt{invokeinterface}$\to$\texttt{invokestatic} (one fewer hash-table
 lookup per call); the inserted \texttt{checkcast} costs about as much in
-the pure interpreter. \texttt{bench\_array} is a clean win because the
+the pure interpreter. \texttt{test9} (array) is a clean win because the
 dispatch sits in the hottest possible loop and the cast is cheap compared
-to an interface lookup; \texttt{bench\_field} shows a small regression
+to an interface lookup; \texttt{test8} (field) shows a small regression
 because three rewritten sites include \texttt{Holder.run} whose original
 \texttt{virtualinvoke} was already fast. The transformation is structured
 to feed the JIT, which inlines the static clone and folds the cast away

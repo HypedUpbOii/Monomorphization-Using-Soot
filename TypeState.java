@@ -10,7 +10,8 @@ public class TypeState {
     }
 
     Set<SootClass> get(Local l) {
-        if (!pts.containsKey(l)) return Collections.emptySet();
+        if (!pts.containsKey(l))
+            return Collections.emptySet();
         return pts.get(l);
     }
 
@@ -36,15 +37,19 @@ public class TypeState {
         all.addAll(other.pts.keySet());
         for (Local l : all) {
             Set<SootClass> u = new HashSet<>();
-            if (this.pts.containsKey(l))  u.addAll(this.pts.get(l));
-            if (other.pts.containsKey(l)) u.addAll(other.pts.get(l));
-            if (!u.isEmpty()) dst.pts.put(l, u);
+            if (this.pts.containsKey(l))
+                u.addAll(this.pts.get(l));
+            if (other.pts.containsKey(l))
+                u.addAll(other.pts.get(l));
+            if (!u.isEmpty())
+                dst.pts.put(l, u);
         }
     }
 
     @Override
     public boolean equals(Object o) {
-        if (!(o instanceof TypeState)) return false;
+        if (!(o instanceof TypeState))
+            return false;
         return ((TypeState) o).pts.equals(this.pts);
     }
 
