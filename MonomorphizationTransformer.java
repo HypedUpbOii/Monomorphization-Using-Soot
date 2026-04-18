@@ -28,7 +28,6 @@ public class MonomorphizationTransformer extends SceneTransformer {
     // cache of already-created static clones
     Map<SootMethod, Map<SootClass, SootMethod>> clones = new HashMap<>();
 
-    // heap abstractions
     Map<SootField, Set<SootClass>> fieldTypes = new HashMap<>();
     Map<Type, Set<SootClass>> arrayElemTypes = new HashMap<>();
 
@@ -37,15 +36,13 @@ public class MonomorphizationTransformer extends SceneTransformer {
         CallGraph cg = Scene.v().getCallGraph();
         List<SootMethod> reachable = collectReachable(cg);
 
-        // outer fixed-point: redo the context-sensitive pass until the global
-        // field / array maps stop changing
+        // outer fixed-point: redo the context-sensitive pass until the global field / array maps stop changing
         int prevF = -1, prevA = -1;
         for (int it = 0; it < 10; it++) {
             runPass(reachable);
             int f = sizeOf(fieldTypes), a = sizeOf(arrayElemTypes);
             if (f == prevF && a == prevA) break;
             prevF = f; prevA = a;
-            if (it == 9) System.err.println("Warning: field/array maps did not converge in 10 iterations");
         }
 
         int n = rewrite(reachable);
@@ -66,13 +63,8 @@ public class MonomorphizationTransformer extends SceneTransformer {
             if (!isApp(m)) continue;
             if (!seen.computeIfAbsent(m, k -> new HashSet<>()).add(deepCopy(ctx))) continue;
 
-            Body body;
-            try {
-                body = m.retrieveActiveBody();
-            } catch (RuntimeException e) {
-                continue;
-            }
-
+            Body body = m.retrieveActiveBody();
+            
             TypeFlowAnalysis tfa = new TypeFlowAnalysis(
                 new BriefUnitGraph(body), ctx, summaries, fieldTypes, arrayElemTypes);
 
@@ -113,13 +105,8 @@ public class MonomorphizationTransformer extends SceneTransformer {
             Map<Stmt, Set<SootClass>> sites = receiversAt.get(m);
             if (sites == null) continue;
 
-            Body body;
-            try {
-                body = m.retrieveActiveBody();
-            } catch (RuntimeException e) {
-                continue;
-            }
-
+            Body body = m.retrieveActiveBody();
+    
             // snapshot the unit chain -- we insert casts while iterating
             for (Unit u : new ArrayList<>(body.getUnits())) {
                 if (!(u instanceof Stmt)) continue;
@@ -136,7 +123,7 @@ public class MonomorphizationTransformer extends SceneTransformer {
                 SootMethod target = resolveConcrete(concrete, iie.getMethod());
                 if (target == null || !target.isConcrete()) continue;
 
-                // boot-loaded JDK classes can't be overridden, so don't create $mono on them
+                // loaded JDK classes can't be overridden, so don't create $mono on them
                 if (isJdk(target.getDeclaringClass())) continue;
 
                 SootMethod clone = getClone(target, concrete);
@@ -170,9 +157,7 @@ public class MonomorphizationTransformer extends SceneTransformer {
     }
 
     SootMethod getClone(SootMethod tgt, SootClass concrete) {
-        return clones
-            .computeIfAbsent(tgt, k -> new HashMap<>())
-            .computeIfAbsent(concrete, k -> makeClone(tgt, concrete));
+        return clones.computeIfAbsent(tgt, k -> new HashMap<>()).computeIfAbsent(concrete, k -> makeClone(tgt, concrete));
     }
 
     SootMethod makeClone(SootMethod tgt, SootClass concrete) {
@@ -213,12 +198,8 @@ public class MonomorphizationTransformer extends SceneTransformer {
             || n.startsWith("com.sun.");
     }
 
-    SootMethod resolveConcrete(SootClass recv, SootMethod m) {
-        try {
-            return Scene.v().getOrMakeFastHierarchy().resolveConcreteDispatch(recv, m);
-        } catch (Exception e) {
-            return null;
-        }
+    SootMethod resolveConcrete(SootClass recv, SootMethod m) {    
+        return Scene.v().getOrMakeFastHierarchy().resolveConcreteDispatch(recv, m);
     }
 
     boolean isApp(SootMethod m) {
@@ -235,8 +216,7 @@ public class MonomorphizationTransformer extends SceneTransformer {
             if (!cur.getDeclaringClass().isApplicationClass()) continue;
             out.add(cur);
 
-            Body body;
-            try { body = cur.retrieveActiveBody(); } catch (RuntimeException e) { continue; }
+            Body body = cur.retrieveActiveBody(); 
             for (Unit u : body.getUnits()) {
                 if (!(u instanceof Stmt)) continue;
                 Stmt s = (Stmt) u;

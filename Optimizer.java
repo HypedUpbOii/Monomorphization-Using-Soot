@@ -19,7 +19,6 @@ public class Optimizer {
         PackManager.v().getPack("wjtp").add(
                 new Transform("wjtp.mono", new MonomorphizationTransformer()));
 
-        // 3. Prepare arguments
         String[] sootArgs = {
             "-cp", classPath,
             "-pp", // sets the class path for Soot
@@ -39,7 +38,6 @@ public class Optimizer {
             "-process-dir", processDir
         };
 
-        // 4. Just call main. It will parse args, load classes, and run the packs.
         soot.Main.main(sootArgs);
     }
 }

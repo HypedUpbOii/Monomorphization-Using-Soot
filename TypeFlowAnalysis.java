@@ -35,7 +35,6 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
         this.fieldTypes = fieldTypes;
         this.arrayElemTypes = arrayElemTypes;
 
-        // walk the identity stmts first so we know which local is which param
         for (Unit u : g) {
             if (!(u instanceof IdentityStmt)) continue;
             IdentityStmt id = (IdentityStmt) u;
@@ -99,7 +98,6 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
     protected void flowThrough(TypeState in, Unit u, TypeState out) {
         in.copy(out);
 
-        // parameter/this seeds -- only fills lhs when caller gave us a type
         if (u instanceof IdentityStmt) {
             IdentityStmt id = (IdentityStmt) u;
             if (!(id.getLeftOp() instanceof Local)) return;
@@ -167,7 +165,6 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
             var calleeSummary = summaries.get(ie.getMethod());
             if (calleeSummary == null || calleeSummary.isEmpty()) return;
 
-            // replicate the context build so we can look the summary up
             Map<Integer, Set<SootClass>> ctx = new HashMap<>();
             if (ie instanceof InstanceInvokeExpr) {
                 Value base = ((InstanceInvokeExpr) ie).getBase();
@@ -200,7 +197,6 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
             return;
         }
 
-        // constants and anything else we don't model -- forget whatever we had
         out.set(left, Collections.emptySet());
     }
 
