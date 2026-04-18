@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# bench.sh — compare DaCapo benchmark runtime with and without monomorphization.
+# bench.sh — compare runtime of bench_* testcases with and without monomorphization.
 #
-# For each benchmark:
-#   1. Run the DaCapo harness N times with -Xint (baseline, no optimization).
-#   2. Apply our monomorphization transformer (emitting .class files).
-#   3. Run the DaCapo harness N times with -Xint, with the transformed classes
-#      prepended to the classpath.
-#   4. Report per-run times and the mean for both configurations.
+# Both baseline and optimized runs use -Xint (interpreter only, no JIT) so that
+# the devirtualization benefit from static dispatch is visible.
+#
+# Usage:
+#   bash bench.sh
+#   RUNS=5 bash bench.sh
+#   BENCHES="bench_array bench_field" bash bench.sh
 
 set -euo pipefail
 
@@ -14,77 +15,96 @@ ROOT=$(cd -- "$(dirname -- "$0")" >/dev/null 2>&1 && pwd)
 cd "$ROOT"
 
 SOOT_JAR=soot-4.6.0-jar-with-dependencies.jar
-DACAPO_JAR=dacapo-9.12-MR1-bach.jar
-MONO_DIR=Monomorphization-Using-Soot
-BENCHES=(${BENCHES:-luindex avrora xalan fop batik})
+BENCHES=(${BENCHES:-bench_array bench_field bench_mixed})
 RUNS=${RUNS:-3}
-SIZE=${SIZE:-small}
-JAVA_XMX=${JAVA_XMX:-6g}
-RESULT_DIR=${RESULT_DIR:-bench-results}
 
-mkdir -p "$RESULT_DIR"
+# Java classpath separator: ; on Windows, : on Unix
+case "${OSTYPE:-}" in
+  msys*|cygwin*|win32*) SEP=";" ;;
+  *) SEP=":" ;;
+esac
 
-# Ensure the transformer is compiled.
-javac -cp "$SOOT_JAR" "$MONO_DIR"/*.java
-javac -cp ".:$SOOT_JAR:$MONO_DIR" MonoBenchmark.java GetSootArgs.java
+die() { echo "ERROR: $*" >&2; exit 1; }
 
-median_and_mean() {
-  # Reads whitespace-separated numbers from stdin, prints "mean min max" to stdout.
-  awk '{
-    for (i=1;i<=NF;i++) { n++; s+=$i; if(n==1||$i<mn)mn=$i; if($i>mx)mx=$i; }
-  } END {
-    if (n==0) { print "0 0 0"; exit }
-    printf "%.2f %.2f %.2f\n", s/n, mn, mx
-  }'
-}
+[[ -f "$SOOT_JAR" ]] || die "Missing $SOOT_JAR — place it in $ROOT"
 
-run_baseline() {
-  local bench=$1 out=$2
-  { /usr/bin/time -p java -Xmx"$JAVA_XMX" -Xint \
-      -cp "$DACAPO_JAR" Harness -s "$SIZE" "$bench" > /dev/null; } 2> "$out"
-  grep '^real' "$out" | awk '{print $2}'
-}
+# ---------------------------------------------------------------------------
+# Build
+# ---------------------------------------------------------------------------
+echo "==> Compiling optimizer..."
+javac -cp "$SOOT_JAR" Optimizer.java TypeState.java TypeFlowAnalysis.java MonomorphizationTransformer.java
 
-run_optimized() {
-  local bench=$1 out=$2 mono_cp=$3
-  { /usr/bin/time -p java -Xmx"$JAVA_XMX" -Xint \
-      -cp "$mono_cp:$DACAPO_JAR" Harness -s "$SIZE" "$bench" > /dev/null; } 2> "$out"
-  grep '^real' "$out" | awk '{print $2}'
-}
-
-printf "%-9s %-6s %-30s %-7s %-7s %-30s %-7s %-7s %-8s\n" \
-  "bench" "sites" "baseline runs (s)" "mean" "min" "optimized runs (s)" "mean" "min" "speedup"
-printf "%s\n" "----------------------------------------------------------------------------------------------------------------------------"
-
+echo "==> Compiling testcases..."
 for b in "${BENCHES[@]}"; do
-  out_dir="tami-outs/out-$b"
-  mono_out="$RESULT_DIR/mono-$b"
-
-  # --- Apply monomorphization (emit class files) ------------------------------
-  rm -rf "$mono_out"
-  java -Xmx"$JAVA_XMX" -cp ".:$SOOT_JAR:$MONO_DIR:$out_dir" \
-    MonoBenchmark "$out_dir" "$mono_out" > "$RESULT_DIR/opt-$b.log" 2>&1 || true
-  sites=$(grep 'Monomorphized call sites' "$RESULT_DIR/opt-$b.log" | tail -1 | awk -F': ' '{print $2}')
-  sites=${sites:-?}
-
-  # --- Baseline runs ---------------------------------------------------------
-  base=""
-  for i in $(seq 1 "$RUNS"); do
-    t=$(run_baseline "$b" "$RESULT_DIR/base-$b-$i.time")
-    base="$base $t"
-  done
-  read base_mean base_min base_max < <(echo "$base" | median_and_mean)
-
-  # --- Optimized runs --------------------------------------------------------
-  opt=""
-  for i in $(seq 1 "$RUNS"); do
-    t=$(run_optimized "$b" "$RESULT_DIR/opt-$b-$i.time" "$mono_out")
-    opt="$opt $t"
-  done
-  read opt_mean opt_min opt_max < <(echo "$opt" | median_and_mean)
-
-  speedup=$(awk -v a="$base_mean" -v b="$opt_mean" 'BEGIN{ if(b>0) printf "%.2fx", a/b; else print "n/a" }')
-
-  printf "%-9s %-6s %-30s %-7s %-7s %-30s %-7s %-7s %-8s\n" \
-    "$b" "$sites" "$base" "$base_mean" "$base_min" "$opt" "$opt_mean" "$opt_min" "$speedup"
+    src="testcases/$b/Test.java"
+    [[ -f "$src" ]] || die "Missing $src"
+    javac -d . "$src"
 done
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# Run java under bash's built-in time, return elapsed seconds (e.g. "12.345").
+timed_run() {
+    local elapsed
+    TIMEFORMAT='%R'
+    elapsed=$( { time java "$@" > /dev/null; } 2>&1 )
+    echo "$elapsed"
+}
+
+mean_of() {
+    # Print mean of space-separated numbers.
+    echo "$*" | awk '{s=0;n=0;for(i=1;i<=NF;i++){s+=$i;n++} if(n>0) printf "%.2f",s/n}'
+}
+
+# ---------------------------------------------------------------------------
+# Header
+# ---------------------------------------------------------------------------
+printf "\n%-13s %5s  %-28s %7s  %-28s %7s  %7s\n" \
+    "benchmark" "sites" "baseline runs -Xint (s)" "mean" \
+    "optimized runs -Xint (s)" "mean" "speedup"
+printf '%s\n' "$(printf '%.0s-' {1..100})"
+
+# ---------------------------------------------------------------------------
+# Run each benchmark
+# ---------------------------------------------------------------------------
+for b in "${BENCHES[@]}"; do
+    main_class="testcases.$b.Test"
+    log_file="/tmp/mono_${b}.log"
+
+    # --- Apply monomorphization --------------------------------------------
+    rm -rf sootOutput
+    java -cp ".${SEP}${SOOT_JAR}" Optimizer "$b" > "$log_file" 2>&1 || true
+    sites=$(grep -m1 'Monomorphized call sites' "$log_file" | awk -F': ' '{print $2}')
+    sites=${sites:-0}
+
+    # --- Baseline runs (original classes, no JIT) --------------------------
+    base_times=""
+    for i in $(seq 1 "$RUNS"); do
+        t=$(timed_run -Xint -cp "." "$main_class")
+        base_times="$base_times $t"
+    done
+
+    # --- Optimized runs (monomorphized classes prepended, no JIT) ----------
+    opt_times=""
+    for i in $(seq 1 "$RUNS"); do
+        t=$(timed_run -Xint -cp "sootOutput${SEP}." "$main_class")
+        opt_times="$opt_times $t"
+    done
+
+    # --- Stats --------------------------------------------------------------
+    base_mean=$(mean_of $base_times)
+    opt_mean=$(mean_of $opt_times)
+    speedup=$(awk -v b="$base_mean" -v o="$opt_mean" \
+        'BEGIN{ if(o+0>0) printf "%.2fx",b/o; else print "n/a" }')
+
+    printf "%-13s %5s  %-28s %7s  %-28s %7s  %7s\n" \
+        "$b" "$sites" "$(echo $base_times)" "$base_mean" \
+        "$(echo $opt_times)" "$opt_mean" "$speedup"
+done
+
+printf '%s\n' "$(printf '%.0s-' {1..100})"
+echo ""
+echo "Note: -Xint disables JIT so dispatch overhead is directly measurable."
+echo "      A speedup > 1x confirms monomorphization reduces virtual dispatch cost."
