@@ -234,13 +234,37 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
     }
 
     private void handleInvokeResult(InvokeExpr ie, Local lhs, TypeState out) {
-        SootMethod callee = ie.getMethod();
-        Map<Map<Integer, Set<SootClass>>, Set<SootClass>> calleeSummary = summaries.get(callee);
-        if (calleeSummary == null || calleeSummary.isEmpty()) return;
+        Set<SootClass> returnedTypes = new HashSet<>();
 
-        Map<Integer, Set<SootClass>> argCtx = buildArgCtx(ie, out);
-        Set<SootClass> returnedTypes = calleeSummary.get(argCtx);
-        if (returnedTypes != null && !returnedTypes.isEmpty()) out.set(lhs, returnedTypes);
+        if (ie instanceof VirtualInvokeExpr || ie instanceof InterfaceInvokeExpr) {
+            // Summaries are stored under concrete methods; must resolve dispatch first.
+            Value base = ((InstanceInvokeExpr) ie).getBase();
+            if (!(base instanceof Local)) return;
+            Set<SootClass> receiverTypes = out.get((Local) base);
+            if (receiverTypes.isEmpty()) return;
+            Map<Integer, Set<SootClass>> argCtx = buildArgCtx(ie, out);
+            FastHierarchy fh = Scene.v().getOrMakeFastHierarchy();
+            for (SootClass receiverType : receiverTypes) {
+                SootMethod concrete;
+                try {
+                    concrete = fh.resolveConcreteDispatch(receiverType, ie.getMethod());
+                } catch (Exception e) { continue; }
+                if (concrete == null) continue;
+                Map<Map<Integer, Set<SootClass>>, Set<SootClass>> calleeSummary = summaries.get(concrete);
+                if (calleeSummary == null) continue;
+                Set<SootClass> ret = calleeSummary.get(argCtx);
+                if (ret != null) returnedTypes.addAll(ret);
+            }
+        } else {
+            SootMethod callee = ie.getMethod();
+            Map<Map<Integer, Set<SootClass>>, Set<SootClass>> calleeSummary = summaries.get(callee);
+            if (calleeSummary == null || calleeSummary.isEmpty()) return;
+            Map<Integer, Set<SootClass>> argCtx = buildArgCtx(ie, out);
+            Set<SootClass> ret = calleeSummary.get(argCtx);
+            if (ret != null) returnedTypes.addAll(ret);
+        }
+
+        if (!returnedTypes.isEmpty()) out.set(lhs, returnedTypes);
     }
 
     private Map<Integer, Set<SootClass>> buildArgCtx(InvokeExpr ie, TypeState state) {

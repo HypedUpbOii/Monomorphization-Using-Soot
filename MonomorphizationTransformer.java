@@ -73,6 +73,9 @@ public class MonomorphizationTransformer extends SceneTransformer {
             prevFieldSize = fieldSize;
             prevArraySize = arraySize;
         }
+        if (iter > maxIter) {
+            System.err.println("Warning: field/array type sets did not converge after " + maxIter + " iterations");
+        }
     }
 
     private void runWorklistOnce(List<SootMethod> reachable) {
