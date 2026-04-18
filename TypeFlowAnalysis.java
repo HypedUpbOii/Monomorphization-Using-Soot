@@ -5,13 +5,18 @@ import soot.Local;
 import soot.RefType;
 import soot.Scene;
 import soot.SootClass;
+import soot.SootField;
 import soot.SootMethod;
+import soot.Type;
 import soot.Unit;
 import soot.Value;
+import soot.jimple.ArrayRef;
 import soot.jimple.AssignStmt;
 import soot.jimple.CastExpr;
+import soot.jimple.FieldRef;
 import soot.jimple.IdentityStmt;
 import soot.jimple.InstanceInvokeExpr;
+import soot.jimple.InterfaceInvokeExpr;
 import soot.jimple.InvokeExpr;
 import soot.jimple.NewExpr;
 import soot.jimple.ParameterRef;
@@ -28,6 +33,10 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
     private final Map<Integer, Set<SootClass>> paramCtx;
     // Interprocedural summaries: method → (paramCtx → return types)
     private final Map<SootMethod, Map<Map<Integer, Set<SootClass>>, Set<SootClass>>> summaries;
+    // Field-based global: field → union of concrete types ever written to it
+    private final Map<SootField, Set<SootClass>> fieldTypes;
+    // Array-element-type-based global: element Type → union of concrete types ever stored
+    private final Map<Type, Set<SootClass>> arrayElemTypes;
 
     // Maps parameter locals back to their index, built from IdentityStmts
     private final Map<Local, Integer> localToParam = new HashMap<>();
@@ -40,11 +49,15 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
     public TypeFlowAnalysis(
         DirectedGraph<Unit> graph,
         Map<Integer, Set<SootClass>> paramCtx,
-        Map<SootMethod, Map<Map<Integer, Set<SootClass>>, Set<SootClass>>> summaries
+        Map<SootMethod, Map<Map<Integer, Set<SootClass>>, Set<SootClass>>> summaries,
+        Map<SootField, Set<SootClass>> fieldTypes,
+        Map<Type, Set<SootClass>> arrayElemTypes
     ) {
         super(graph);
         this.paramCtx = paramCtx;
         this.summaries = summaries;
+        this.fieldTypes = fieldTypes;
+        this.arrayElemTypes = arrayElemTypes;
         initializeParams();
         doAnalysis();
         finalizeResults();
@@ -101,9 +114,9 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
             }
             if (!argCtx.isEmpty()) callSiteArgCtx.put(stmt, argCtx);
 
-            // For virtual calls specifically, record receiver concrete types
-            if (ie instanceof VirtualInvokeExpr) {
-                Value base = ((VirtualInvokeExpr) ie).getBase();
+            // For dispatched calls (virtual or interface) record receiver concrete types
+            if (ie instanceof VirtualInvokeExpr || ie instanceof InterfaceInvokeExpr) {
+                Value base = ((InstanceInvokeExpr) ie).getBase();
                 if (base instanceof Local) {
                     Set<SootClass> types = before.get((Local) base);
                     if (!types.isEmpty()) receiverTypesAtSite.put(stmt, new HashSet<>(types));
@@ -137,9 +150,20 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
 
     private void handleAssignment(AssignStmt stmt, TypeState out) {
         Value lhs = stmt.getLeftOp();
+        Value rhs = stmt.getRightOp();
+
+        // Writes to fields or arrays: contribute rhs types to the global map
+        if (lhs instanceof FieldRef) {
+            recordFieldWrite((FieldRef) lhs, rhs, out);
+            return;
+        }
+        if (lhs instanceof ArrayRef) {
+            recordArrayWrite((ArrayRef) lhs, rhs, out);
+            return;
+        }
+
         if (!(lhs instanceof Local)) return;
         Local lhsLocal = (Local) lhs;
-        Value rhs = stmt.getRightOp();
 
         if (rhs instanceof NewExpr) {
             SootClass cls = ((NewExpr) rhs).getBaseType().getSootClass();
@@ -154,7 +178,6 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
 
         if (rhs instanceof Local) {
             Set<SootClass> types = out.get((Local) rhs);
-            // Propagate if known; clear if source is unknown so we don't carry stale types
             out.set(lhsLocal, types);
             return;
         }
@@ -164,9 +187,38 @@ public class TypeFlowAnalysis extends ForwardFlowAnalysis<Unit, TypeState> {
             return;
         }
 
-        // FieldRef, ArrayRef, or any other untracked source — clear to avoid stale type info
-        // from a previous assignment to the same local
+        // Reads from fields or arrays: fill lhs with the current global type set
+        if (rhs instanceof FieldRef) {
+            SootField f = ((FieldRef) rhs).getField();
+            Set<SootClass> t = fieldTypes.get(f);
+            out.set(lhsLocal, t == null ? Collections.emptySet() : t);
+            return;
+        }
+        if (rhs instanceof ArrayRef) {
+            Type et = ((ArrayRef) rhs).getType();
+            Set<SootClass> t = arrayElemTypes.get(et);
+            out.set(lhsLocal, t == null ? Collections.emptySet() : t);
+            return;
+        }
+
+        // Any other rhs (constants, etc.) — clear to avoid stale type info
         out.set(lhsLocal, Collections.emptySet());
+    }
+
+    private void recordFieldWrite(FieldRef fieldRef, Value rhs, TypeState state) {
+        if (!(rhs instanceof Local)) return;
+        Set<SootClass> types = state.get((Local) rhs);
+        if (types.isEmpty()) return;
+        SootField f = fieldRef.getField();
+        fieldTypes.computeIfAbsent(f, k -> new HashSet<>()).addAll(types);
+    }
+
+    private void recordArrayWrite(ArrayRef arrayRef, Value rhs, TypeState state) {
+        if (!(rhs instanceof Local)) return;
+        Set<SootClass> types = state.get((Local) rhs);
+        if (types.isEmpty()) return;
+        Type et = arrayRef.getType();
+        arrayElemTypes.computeIfAbsent(et, k -> new HashSet<>()).addAll(types);
     }
 
     private void handleCast(CastExpr cast, Local lhs, TypeState out) {

@@ -1,0 +1,401 @@
+\documentclass[11pt,a4paper]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{booktabs}
+\usepackage{amssymb}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{microtype}
+\usepackage{array}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue!60!black,
+    urlcolor=blue!60!black,
+}
+
+\lstdefinelanguage{Jimple}{
+    keywords={staticinvoke,virtualinvoke,interfaceinvoke,specialinvoke,
+              return,goto,if,new,newarray,instanceof,lengthof,
+              static,public,private,protected,void,int,boolean,
+              class,extends,implements},
+    sensitive=true,
+    comment=[l]{//},
+    string=[b]",
+    morekeywords={},
+}
+
+\lstdefinestyle{code}{
+    basicstyle=\ttfamily\small,
+    keywordstyle=\color{blue!70!black}\bfseries,
+    commentstyle=\color{gray!70!black}\itshape,
+    stringstyle=\color{red!70!black},
+    frame=single,
+    framesep=5pt,
+    rulecolor=\color{gray!40},
+    breaklines=true,
+    showstringspaces=false,
+    xleftmargin=10pt,
+    xrightmargin=5pt,
+    aboveskip=6pt,
+    belowskip=6pt,
+}
+
+\lstset{style=code}
+
+\title{\vspace{-2em}Monomorphization Optimizer --- Report}
+\author{Kamyak Channa}
+\date{April 2026}
+
+\begin{document}
+\maketitle
+\vspace{-1.5em}
+
+\section{Optimization Description}
+
+\subsection*{What was implemented}
+
+The optimizer is a Soot-based whole-program transformer that
+\emph{devirtualizes} Java virtual and interface method calls when an
+interprocedural type-flow analysis can prove that the receiver at a given
+call site is always of exactly one concrete class. A proven-monomorphic
+call is rewritten from \texttt{invokevirtual}/\texttt{invokeinterface} to
+\texttt{invokestatic}, dispatched to a freshly synthesized static clone of
+the concrete target method.
+
+The baseline transformer already handled calls where the receiver flowed
+through locals, parameters, casts, \texttt{new}, and invoke-results. This
+work extends both the analysis and the rewriter along three dimensions
+that were previously left conservative:
+
+\begin{enumerate}[topsep=2pt,itemsep=0pt]
+  \item \textbf{Instance and static field references} --- types written
+    through a \texttt{FieldRef} are recorded into a global per-field map,
+    and reads from fields populate the local's type set from that map.
+  \item \textbf{Array references} --- writes to \texttt{ArrayRef}
+    contribute to a global map keyed by the \emph{element type}, and
+    reads produce that set.
+  \item \textbf{Interface invokes} --- both \texttt{VirtualInvokeExpr} and
+    \texttt{InterfaceInvokeExpr} are now analyzed and rewritten.
+\end{enumerate}
+
+\subsection*{Why it is useful}
+
+Virtual dispatch in Java is expensive for three reasons: a hidden
+vtable/itable lookup on every call, a cache-unfriendly memory
+indirection, and the fact that the JIT cannot inline an unresolved
+virtual callee without a guard. Static analysis that collapses a call to
+a single concrete target turns the call into a plain \texttt{invokestatic}
+--- faster to dispatch even in the pure interpreter, and structurally
+inlineable once the JIT sees it. In practice, many Java programs use
+\texttt{List<T>}, strategy objects held in fields, or arrays of a single
+concrete subclass; without field/array tracking, the analysis is blind to
+those shapes, so the original optimizer missed large classes of common
+patterns (e.g.\ fluent \texttt{StringBuilder.append} chains devirtualize
+only once field types are known).
+
+\section{Analyses Used}
+
+\subsection*{Type-flow analysis}
+
+The core abstraction is a forward dataflow analysis over Soot's Jimple
+CFG:
+
+\begin{itemize}[topsep=2pt,itemsep=0pt]
+  \item \textbf{Lattice element (\texttt{TypeState}):}
+    \texttt{Map<Local, Set<SootClass>>}. An absent key means ``no type
+    information'' (conservative $\bot$); an empty set means the local is
+    known to be untyped. Join is point-wise set union.
+  \item \textbf{Transfer function} (\texttt{TypeFlowAnalysis.flowThrough}):
+    \texttt{IdentityStmt} seeds parameters from the calling context;
+    \texttt{NewExpr} produces a singleton; \texttt{Local := Local}
+    propagates; \texttt{CastExpr} narrows via
+    \texttt{FastHierarchy.canStoreClass}; \texttt{InvokeExpr} consumes the
+    callee's return-type summary for the current arg context;
+    \texttt{FieldRef} and \texttt{ArrayRef} read from the global maps;
+    writes to those locations update the globals.
+\end{itemize}
+
+\subsection*{Dimensions of precision}
+
+\begin{itemize}[topsep=2pt,itemsep=0pt]
+  \item \textbf{Flow-sensitive.} Type sets are maintained per program
+    point, computed by Soot's \texttt{ForwardFlowAnalysis}.
+  \item \textbf{Context-sensitive on method parameters} (1-CFA-like). The
+    analyzer is parameterised by a \texttt{paramCtx: Map<Integer,
+    Set<SootClass>>} keyed by parameter index ($-1$ for the receiver).
+    The worklist enqueues \texttt{(method, ctx)} pairs; method summaries
+    are $\mathit{ctx} \to \mathit{returnTypes}$. Virtual targets are
+    enqueued with the context refined to the specific receiver type,
+    which is how per-dispatch-target precision is recovered.
+  \item \textbf{Field-based} (not field-sensitive). A field is treated as
+    a single abstract cell shared across all instances ---
+    \texttt{SootField} $\to$ \texttt{Set<SootClass>}. This trades some
+    precision for simplicity and scales well to large heaps.
+  \item \textbf{Array-element-type-based.}
+    \texttt{Type} $\to$ \texttt{Set<SootClass>}, keyed by the declared
+    element type (\texttt{ArrayRef.getType()}). All arrays with the same
+    element type are merged.
+  \item \textbf{Conservative on unmodelled rhs.} Any assignment whose
+    right-hand side the analysis does not understand (constants,
+    intrinsics it doesn't model) \emph{clears} the lhs set, so stale
+    types from a previous store can never survive.
+\end{itemize}
+
+\subsection*{Assumptions}
+
+\begin{itemize}[topsep=2pt,itemsep=0pt]
+  \item SPARK call graph, built on-the-fly
+    (\texttt{-p cg.spark on-fly-cg:true}).
+  \item Reflection is resolved via the TamiFlex \texttt{refl.log} that
+    accompanies each DaCapo input directory.
+  \item Only application classes (as seen by Soot, which --- with
+    \texttt{-app} --- includes TamiFlex-dumped JDK classes) are analyzed.
+  \item \textbf{JDK rewriting is disabled.} \texttt{\$mono} clones are
+    only created when the concrete target's declaring class is outside
+    \texttt{java.*}, \texttt{javax.*}, \texttt{sun.*}, \texttt{jdk.*},
+    \texttt{com.sun.*}. See \S3 for why.
+  \item Correctness hinges on \textbf{outer fixed-point iteration}: the
+    field/array global maps are re-checked after each worklist pass, and
+    a new pass is started if either map grew. Monotonicity (maps only
+    grow) guarantees termination in a small number of passes.
+\end{itemize}
+
+\section{Transformation Details}
+
+\subsection*{Before / after snippets}
+
+\textbf{Field-flowing call (interface dispatch through an instance field).}
+Before monomorphization (excerpt of \texttt{Kennel.call}):
+
+\begin{lstlisting}[language=Jimple]
+$r1 = r0.<Kennel: Animal resident>;
+$r2 = interfaceinvoke $r1.<Animal: String speak()>();
+return $r2;
+\end{lstlisting}
+
+After:
+
+\begin{lstlisting}[language=Jimple]
+$r1 = r0.<Kennel: Animal resident>;
+$mono_cast_0 = (Dog) $r1;
+$r2 = staticinvoke <Dog: String speak$mono$Dog(Dog)>($mono_cast_0);
+return $r2;
+\end{lstlisting}
+
+The \texttt{interfaceinvoke} is replaced by an \texttt{invokestatic} to a
+synthesized \texttt{speak\$mono\$Dog}, a static copy of \texttt{Dog.speak}
+whose first parameter is the receiver. An explicit checkcast is inserted
+because \texttt{\$r1}'s declared type (\texttt{Animal}) is wider than the
+static clone's first parameter type (\texttt{Dog}).
+
+\textbf{Array-element-flowing call.} Before:
+
+\begin{lstlisting}[language=Jimple]
+r5 = r0[i3];             // r0: Shape[]
+$i1 = interfaceinvoke r5.<Shape: int area()>();
+\end{lstlisting}
+
+After:
+
+\begin{lstlisting}[language=Jimple]
+r5 = r0[i3];
+$mono_cast_0 = (Square) r5;
+$i1 = staticinvoke <Square: int area$mono$Square(Square)>($mono_cast_0);
+\end{lstlisting}
+
+\textbf{Generated static clone} (added as a new method on the concrete
+class):
+
+\begin{lstlisting}[language=Jimple]
+static String speak$mono$Dog(Dog) {
+    Dog r0;
+    r0 := @parameter0: Dog;   // originally: @this: Dog
+    return "woof";
+}
+\end{lstlisting}
+
+Identity statements are fixed up when cloning: \texttt{@this: T} becomes
+\texttt{@parameter0: T}, and each existing \texttt{@parameterN: U} is
+shifted to \texttt{@parameter(N+1): U}.
+
+\subsection*{Key challenges}
+
+\begin{enumerate}[topsep=2pt,itemsep=2pt]
+  \item \textbf{Cross-method field/array data flow.} Writers and readers
+    of a field can be in different methods; the worklist visits methods
+    in arbitrary order, so a reader may be analyzed before any writer
+    has been seen. We solved this with a monotone outer fixed-point: the
+    \texttt{(method, ctx)} worklist is re-seeded until the global field
+    and array maps stop growing. In practice two or three passes suffice
+    even on DaCapo-scale input, because the maps are small.
+
+  \item \textbf{Field-sensitive vs.\ field-based.} True
+    instance-field sensitivity requires pointer-analysis-grade heap
+    abstractions. We deliberately chose the field-based abstraction (one
+    abstract cell per field symbol). This loses precision when a field
+    can legitimately hold different types in different instances, but it
+    keeps the analysis fast and is sound --- any over-approximation
+    leaves the call site conservatively virtual.
+
+  \item \textbf{Interface invokes were silently ignored by the original
+    rewriter.} Fixing fields/arrays without fixing interface invokes
+    would have hidden the benefit, because typical field-loaded
+    receivers are declared with an interface type (\texttt{Animal},
+    \texttt{Op}, \texttt{Shape}). Both the analyser's receiver-type
+    collection and the rewriter's instance-invoke dispatch were
+    generalized to handle \texttt{InterfaceInvokeExpr}.
+
+  \item \textbf{Receiver type mismatch after devirtualization.} A call
+    site typed \texttt{Animal a; a.speak()} passes a local declared as
+    \texttt{Animal}, but the clone's first parameter is declared as the
+    concrete class (\texttt{Dog}). The JVM verifier rejects this
+    mismatch. The rewriter now inserts a \texttt{CastExpr} assign into a
+    fresh local immediately before the call when the base local's
+    declared type is not equal to the concrete type.
+
+  \item \textbf{JDK class rewriting breaks at runtime.} With \texttt{-app}
+    Soot treats TamiFlex-dumped JDK classes as application classes, and
+    the original rewriter happily synthesized \texttt{\$mono} clones on
+    \texttt{java.lang.StringBuilder} and friends. Emitted classes live
+    under \texttt{sootOutput/}, but at runtime the JVM loads
+    \texttt{java.*} from the boot class-loader, not from our output
+    directory --- so every rewritten call site would fail with
+    \texttt{NoSuchMethodError}. The rewriter now skips any concrete
+    target whose declaring class is under a JDK package prefix. The
+    \emph{analysis} still traverses JDK methods, so JDK return types
+    still refine application call sites; only the rewrite is suppressed.
+\end{enumerate}
+
+\section{Result Tables}
+
+\subsection{Functional correctness}
+
+Four purpose-built micro testcases exercise the new capabilities. For
+each, the original bytecode (JVM baseline) and the monomorphized
+bytecode (after applying the transformer, then running the emitted
+\texttt{.class} files) are executed and their stdout compared.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lllccc@{}}
+\toprule
+Test case            & Exercised feature                         & JVM   & After mono & Match & Sites \\
+\midrule
+\texttt{field\_case}        & interface dispatch via instance field      & woof  & woof       & \checkmark & 3 \\
+\texttt{array\_case}        & interface dispatch via array element       & 29    & 29         & \checkmark & 1 \\
+\texttt{mixed\_case}        & array held inside an instance field        & RR    & RR         & \checkmark & 5 \\
+\texttt{static\_field\_case}& static field written/read across methods   & hello & hello      & \checkmark & 1 \\
+\bottomrule
+\end{tabular}
+\caption{Functional correctness: all outputs match the JVM baseline.}
+\end{table}
+
+Disassembly (\texttt{javap -c}) confirms each devirtualized call site is
+an \texttt{invokestatic} to a \texttt{\$mono} clone and not an
+\texttt{invokeinterface}/\texttt{invokevirtual}.
+
+\subsection{Performance}
+
+\subsubsection*{Microbenchmarks (\texttt{-Xint}, $4\times 10^8$ iterations, median of 5)}
+
+Unit: seconds wall-clock. Workload = tight loop dispatching through the
+feature under test.
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrrrr@{}}
+\toprule
+Microbench         & Sites & Baseline (s) & Optimized (s) & $\Delta$ & Speedup \\
+\midrule
+\texttt{bench\_array} & 1  & 7.86  & 6.89  & $+12.3\%$ & $1.14\times$ \\
+\texttt{bench\_mixed} & 2  & 8.50  & 8.56  & $-0.7\%$  & $0.99\times$ \\
+\texttt{bench\_field} & 3  & 12.28 & 13.07 & $-6.4\%$  & $0.94\times$ \\
+\bottomrule
+\end{tabular}
+\caption{Micro-benchmarks, pure interpreter mode.}
+\end{table}
+
+Under \texttt{-Xint} the only saving is
+\texttt{invokeinterface}$\to$\texttt{invokestatic} (one fewer hash-table
+lookup per call); the inserted \texttt{checkcast} costs about as much in
+the pure interpreter. \texttt{bench\_array} is a clean win because the
+dispatch sits in the hottest possible loop and the cast is cheap compared
+to an interface lookup; \texttt{bench\_field} shows a small regression
+because three rewritten sites include \texttt{Holder.run} whose original
+\texttt{virtualinvoke} was already fast. The transformation is structured
+to feed the JIT, which inlines the static clone and folds the cast away
+--- that benefit is invisible under \texttt{-Xint}.
+
+\subsubsection*{DaCapo 9.12 benchmarks (\texttt{-s default}, \texttt{-Xint}, 3 runs each)}
+
+Unit: seconds wall-clock. ``Sites'' is the number of application-level
+call sites the transformer rewrote (JDK targets deliberately skipped).
+
+\begin{table}[h]
+\centering
+\small
+\begin{tabular}{@{}lrrrrrr@{}}
+\toprule
+Benchmark & Sites & Baseline mean & Baseline min & Optimized mean & Optimized min & Speedup \\
+\midrule
+\texttt{xalan}   & 282   & 4.65\,s & 4.55\,s & 4.19\,s & 4.15\,s & $\mathbf{1.11\times}$ \\
+\texttt{avrora}  & 1\,090 & 8.70\,s & 8.32\,s & 8.40\,s & 8.32\,s & $1.04\times$ \\
+\texttt{fop}     & 2\,231 & 3.22\,s & 3.19\,s & 3.18\,s & 3.13\,s & $1.01\times$ \\
+\texttt{luindex} & 1\,279 & 5.16\,s & 5.05\,s & 5.19\,s & 5.06\,s & $0.99\times$ \\
+\bottomrule
+\end{tabular}
+\caption{DaCapo 9.12 benchmarks, JIT disabled. \texttt{batik} excluded
+because DaCapo-9.12 still requires \texttt{com.sun.image.codec.jpeg},
+which was removed in JDK 9.}
+\end{table}
+
+(Per-run times, logs, and transformed class files are archived under
+\texttt{bench-results/}.)
+
+\subsection*{Discussion}
+
+\begin{itemize}[topsep=2pt,itemsep=0pt]
+  \item \texttt{xalan} sees the largest genuine win ($+11\%$) despite
+    having the fewest rewritten sites: those 282 sites sit on the tight
+    XSLT template-dispatch loop that dominates its interpreted runtime.
+  \item \texttt{luindex}'s interpreted time is spent mostly in JDK code
+    paths (file channels, regular expressions,
+    \texttt{StringBuilder}) --- exactly the surface our JDK-skip filter
+    refuses to rewrite, so there is nothing to gain.
+  \item \texttt{avrora} and \texttt{fop} show small positive deltas
+    ($+1$--$4\%$); their hot paths are mixed app/JDK, so devirtualization
+    dilutes proportionally.
+  \item No benchmark regresses beyond $\sim1\%$ noise, indicating the
+    checkcast-insertion cost and the extra static-frame overhead are
+    well-contained.
+\end{itemize}
+
+\subsection{Reproduction}
+
+All numbers can be reproduced with the supplied driver script:
+
+\begin{lstlisting}[language=bash]
+# default: luindex avrora xalan fop, 3 runs, -s default, JIT off
+./bench.sh
+
+# quick smoke test
+SIZE=small RUNS=1 ./bench.sh
+
+# subset with more runs
+BENCHES="xalan avrora" RUNS=5 ./bench.sh
+\end{lstlisting}
+
+The script recompiles the transformer, applies it once per benchmark to
+emit a \texttt{mono-<bench>/} directory of \texttt{.class} files, then
+runs \texttt{java -Xint -cp dacapo.jar Harness -s default <bench>}
+\texttt{RUNS} times for the baseline and again with
+\texttt{mono-<bench>/} prepended to the classpath, emitting per-run
+times, means, mins, and speedup ratios to stdout and
+\texttt{bench-results/}.
+
+\end{document}

@@ -34,7 +34,7 @@ public class Optimizer {
             "-exclude", "sun.*",
             "-exclude", "com.sun.*",
             "-exclude", "jdk.*",
-            "-f", "J",
+            "-f", "c",
             "-main-class", mainClass,
             "-process-dir", processDir
         };

@@ -6,6 +6,7 @@ import soot.Modifier;
 import soot.Scene;
 import soot.SceneTransformer;
 import soot.SootClass;
+import soot.SootField;
 import soot.SootMethod;
 import soot.Type;
 import soot.Unit;
@@ -13,6 +14,7 @@ import soot.Value;
 import soot.jimple.AssignStmt;
 import soot.jimple.IdentityStmt;
 import soot.jimple.InstanceInvokeExpr;
+import soot.jimple.InterfaceInvokeExpr;
 import soot.jimple.InvokeExpr;
 import soot.jimple.InvokeStmt;
 import soot.jimple.Jimple;
@@ -36,6 +38,11 @@ public class MonomorphizationTransformer extends SceneTransformer {
     // Cache of created static clones: concreteMethod → concreteType → static clone
     private final Map<SootMethod, Map<SootClass, SootMethod>> monoClones = new HashMap<>();
 
+    // Field-based global: field → union of concrete types ever written to it
+    private final Map<SootField, Set<SootClass>> fieldTypes = new HashMap<>();
+    // Array-element-type-based global: element Type → union of concrete types stored
+    private final Map<Type, Set<SootClass>> arrayElemTypes = new HashMap<>();
+
     @Override
     protected void internalTransform(String phaseName, Map<String, String> options) {
         CallGraph callGraph = Scene.v().getCallGraph();
@@ -52,13 +59,28 @@ public class MonomorphizationTransformer extends SceneTransformer {
     // -------------------------------------------------------------------------
 
     private void runContextSensitiveAnalysis(List<SootMethod> reachable) {
+        // Outer fixed-point: when field/array global maps grow, re-run the worklist
+        // so that readers of those fields/arrays pick up the newly-known types.
+        int prevFieldSize = -1;
+        int prevArraySize = -1;
+        int iter = 0;
+        int maxIter = 10;
+        while (iter++ < maxIter) {
+            runWorklistOnce(reachable);
+            int fieldSize = totalSize(fieldTypes);
+            int arraySize = totalSize(arrayElemTypes);
+            if (fieldSize == prevFieldSize && arraySize == prevArraySize) break;
+            prevFieldSize = fieldSize;
+            prevArraySize = arraySize;
+        }
+    }
+
+    private void runWorklistOnce(List<SootMethod> reachable) {
         Deque<AnalysisTask> worklist = new ArrayDeque<>();
-        // Track which (method, context) pairs have already been processed
+        // Track which (method, context) pairs have already been processed this pass
         Map<SootMethod, Set<Map<Integer, Set<SootClass>>>> processed = new HashMap<>();
 
         // Seed: all reachable application methods with an empty (unknown) context.
-        // Entry points are covered here; methods reachable only from library code
-        // get the conservative empty-context analysis as a fallback.
         for (SootMethod m : reachable) {
             worklist.add(new AnalysisTask(m, new HashMap<>()));
         }
@@ -70,7 +92,6 @@ public class MonomorphizationTransformer extends SceneTransformer {
 
             if (!isAnalyzable(method)) continue;
 
-            // Skip if we already processed this (method, context) pair
             Set<Map<Integer, Set<SootClass>>> methodCtxs =
                 processed.computeIfAbsent(method, k -> new HashSet<>());
             if (!methodCtxs.add(deepCopyContext(paramCtx))) continue;
@@ -83,28 +104,23 @@ public class MonomorphizationTransformer extends SceneTransformer {
             }
 
             TypeFlowAnalysis tfa = new TypeFlowAnalysis(
-                new BriefUnitGraph(body), paramCtx, summaries
+                new BriefUnitGraph(body), paramCtx, summaries, fieldTypes, arrayElemTypes
             );
 
-            // Update this method's return-type summary for this context
             summaries.computeIfAbsent(method, k -> new HashMap<>())
                      .put(deepCopyContext(paramCtx), new HashSet<>(tfa.returnTypes));
 
-            // Accumulate receiver types for each virtual call site (union across contexts)
             Map<Stmt, Set<SootClass>> sitesForMethod =
                 receiverTypesPerSite.computeIfAbsent(method, k -> new HashMap<>());
             tfa.receiverTypesAtSite.forEach((stmt, types) ->
                 sitesForMethod.computeIfAbsent(stmt, k -> new HashSet<>()).addAll(types));
 
-            // Enqueue callees with the concrete argument contexts we just discovered
             for (Map.Entry<Stmt, Map<Integer, Set<SootClass>>> entry : tfa.callSiteArgCtx.entrySet()) {
                 Stmt callSite = entry.getKey();
                 Map<Integer, Set<SootClass>> argCtx = entry.getValue();
                 InvokeExpr ie = callSite.getInvokeExpr();
 
-                if (ie instanceof VirtualInvokeExpr) {
-                    // For virtual calls: enqueue each concrete dispatch target separately,
-                    // refining the context with the specific receiver type
+                if (ie instanceof VirtualInvokeExpr || ie instanceof InterfaceInvokeExpr) {
                     Set<SootClass> receiverTypes = tfa.receiverTypesAtSite.get(callSite);
                     if (receiverTypes == null) continue;
                     for (SootClass receiverType : receiverTypes) {
@@ -124,6 +140,12 @@ public class MonomorphizationTransformer extends SceneTransformer {
         }
     }
 
+    private static <K> int totalSize(Map<K, Set<SootClass>> m) {
+        int n = 0;
+        for (Set<SootClass> v : m.values()) n += v.size();
+        return n;
+    }
+
     // -------------------------------------------------------------------------
     // Rewriting: VirtualInvokeExpr → StaticInvokeExpr on a cloned static method
     // -------------------------------------------------------------------------
@@ -141,27 +163,47 @@ public class MonomorphizationTransformer extends SceneTransformer {
                 continue;
             }
 
-            for (Unit unit : body.getUnits()) {
+            for (Unit unit : new ArrayList<>(body.getUnits())) {
                 if (!(unit instanceof Stmt)) continue;
                 Stmt stmt = (Stmt) unit;
                 if (!stmt.containsInvokeExpr()) continue;
-                if (!(stmt.getInvokeExpr() instanceof VirtualInvokeExpr)) continue;
+                InvokeExpr invokeExpr = stmt.getInvokeExpr();
+                if (!(invokeExpr instanceof VirtualInvokeExpr || invokeExpr instanceof InterfaceInvokeExpr)) continue;
 
                 Set<SootClass> receiverTypes = sites.get(stmt);
                 // Only devirtualize if all observed contexts agree on a single concrete type
                 if (receiverTypes == null || receiverTypes.size() != 1) continue;
 
                 SootClass concreteType = receiverTypes.iterator().next();
-                VirtualInvokeExpr vie = (VirtualInvokeExpr) stmt.getInvokeExpr();
-                SootMethod concreteMethod = resolveDispatch(concreteType, vie.getMethod());
+                InstanceInvokeExpr iie = (InstanceInvokeExpr) invokeExpr;
+                SootMethod concreteMethod = resolveDispatch(concreteType, iie.getMethod());
                 if (concreteMethod == null || !concreteMethod.isConcrete()) continue;
+                // Never materialize $mono clones on JDK classes — the JVM loads those
+                // from the boot classpath at runtime and won't see our rewritten copies.
+                if (isJdkClass(concreteMethod.getDeclaringClass())) continue;
 
                 SootMethod staticClone = getOrCreateStaticClone(concreteMethod, concreteType);
 
+                // The static clone expects the receiver typed as concreteType. If the
+                // base local has a wider declared type (e.g. an interface), insert a
+                // cast: tmp = (concreteType) base; then pass tmp.
+                Value receiverValue = iie.getBase();
+                if (receiverValue instanceof Local
+                        && !concreteType.getType().equals(((Local) receiverValue).getType())) {
+                    Local castLocal = Jimple.v().newLocal(
+                        "$mono_cast_" + count, concreteType.getType());
+                    body.getLocals().add(castLocal);
+                    AssignStmt castStmt = Jimple.v().newAssignStmt(
+                        castLocal,
+                        Jimple.v().newCastExpr(receiverValue, concreteType.getType()));
+                    body.getUnits().insertBefore(castStmt, stmt);
+                    receiverValue = castLocal;
+                }
+
                 // staticinvoke args: [receiver, originalArg0, originalArg1, ...]
                 List<Value> allArgs = new ArrayList<>();
-                allArgs.add(vie.getBase());
-                allArgs.addAll(vie.getArgs());
+                allArgs.add(receiverValue);
+                allArgs.addAll(iie.getArgs());
 
                 soot.jimple.StaticInvokeExpr staticExpr =
                     Jimple.v().newStaticInvokeExpr(staticClone.makeRef(), allArgs);
@@ -228,6 +270,13 @@ public class MonomorphizationTransformer extends SceneTransformer {
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
+
+    private static boolean isJdkClass(SootClass sc) {
+        String n = sc.getName();
+        return n.startsWith("java.") || n.startsWith("javax.")
+            || n.startsWith("sun.")  || n.startsWith("jdk.")
+            || n.startsWith("com.sun.");
+    }
 
     private SootMethod resolveDispatch(SootClass receiverType, SootMethod virtualMethod) {
         try {
